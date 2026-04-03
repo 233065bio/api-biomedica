@@ -1,0 +1,26 @@
+# 1. Actualiza el modelo de datos
+class LecturaSensor(BaseModel):
+    tiempo_ms: int
+    ecg: float
+    spo2: float
+    acc_x: float
+    acc_y: float
+    acc_z: float
+    giro_x: float
+    giro_y: float
+    giro_z: float
+    flujo_respiratorio: float # <--- Añadido
+
+# 2. Actualiza la función de subir-datos
+@app.post("/subir-datos")
+async def recibir_datos(lecturas: List[LecturaSensor]):
+    # ... (conexión igual)
+    sql = """INSERT INTO datos_sensores 
+             (tiempo_ms, ecg, spo2, acc_x, acc_y, acc_z, giro_x, giro_y, giro_z, flujo_respiratorio) 
+             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+    
+    valores = [
+        (l.tiempo_ms, l.ecg, l.spo2, l.acc_x, l.acc_y, l.acc_z, l.giro_x, l.giro_y, l.giro_z, l.flujo_respiratorio) 
+        for l in lecturas
+    ]
+    # ... (ejecución igual)
