@@ -73,6 +73,16 @@ async def recibir_datos(lecturas: List[LecturaSensor]):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/datos")
+def obtener_datos():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM datos_sensores LIMIT 10")
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return rows        
+
 @app.get("/")
 def home():
     return {"mensaje": "API de Monitoreo activa y Tabla vinculada"}
