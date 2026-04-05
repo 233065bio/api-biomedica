@@ -1,14 +1,11 @@
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import FastAPI, HTTPException, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import mysql.connector
 import os
-import secrets
 
 app = FastAPI()
-security = HTTPBasic()
 
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
@@ -22,13 +19,8 @@ def get_db_connection():
         port=int(os.getenv("MYSQL_PORT") or 3306)
     )
 
-def verificar_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    ok_user = secrets.compare_digest(credentials.username, ADMIN_USER)
-    ok_pass = secrets.compare_digest(credentials.password, ADMIN_PASS)
-    if not (ok_user and ok_pass):
-        raise HTTPException(status_code=401, detail="No autorizado",
-                            headers={"WWW-Authenticate": "Basic"})
-    return credentials.username
+def verificar_sesion(request: Request):
+    return request.cookies.get("session") == "ok"
 
 # ─────────────────────────────────────────────
 # CREAR TABLAS AL INICIAR
@@ -38,7 +30,6 @@ def startup_event():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS usuarios (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -46,7 +37,6 @@ def startup_event():
                 contrasena VARCHAR(255) NOT NULL
             )
         """)
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS pacientes (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -59,7 +49,6 @@ def startup_event():
                 epworth INT
             )
         """)
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sesiones (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -68,7 +57,6 @@ def startup_event():
                 FOREIGN KEY (paciente_id) REFERENCES pacientes(id)
             )
         """)
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS horas_sesion (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -79,7 +67,6 @@ def startup_event():
                 FOREIGN KEY (sesion_id) REFERENCES sesiones(id)
             )
         """)
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS interrupciones (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -93,7 +80,6 @@ def startup_event():
                 FOREIGN KEY (hora_sesion_id) REFERENCES horas_sesion(id)
             )
         """)
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS senales_esp32 (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -104,12 +90,10 @@ def startup_event():
                 FOREIGN KEY (interrupcion_id) REFERENCES interrupciones(id)
             )
         """)
-
         cursor.execute("""
             INSERT IGNORE INTO usuarios (usuario, contrasena)
             VALUES ('admin', 'admin123')
         """)
-
         conn.commit()
         cursor.close()
         conn.close()
@@ -146,6 +130,72 @@ class PacienteModel(BaseModel):
 class UsuarioModel(BaseModel):
     usuario: str
     contrasena: str
+
+# ─────────────────────────────────────────────
+# LOGIN ADMIN
+# ─────────────────────────────────────────────
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return """
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <title>AOS — Login</title>
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body { font-family: Arial, sans-serif; background: #EEF5FB;
+                   display: flex; justify-content: center; align-items: center;
+                   height: 100vh; }
+            .card { background: white; border-radius: 10px; padding: 40px;
+                    width: 380px; box-shadow: 0 8px 32px rgba(44,74,90,0.12);
+                    border: 1px solid #D4E8F3; }
+            h1 { font-family: 'Times New Roman', serif; color: #2C4A5A;
+                 text-align: center; margin-bottom: 8px; font-size: 24px; }
+            p { text-align: center; color: #5A7A8A; font-size: 13px; margin-bottom: 28px; }
+            label { display: block; font-size: 12px; color: #5A7A8A;
+                    font-weight: bold; margin-bottom: 4px; }
+            input { width: 100%; padding: 10px 14px; border: 1px solid #D4E8F3;
+                    border-radius: 4px; font-size: 14px; background: #EEF5FB;
+                    color: #2C4A5A; margin-bottom: 16px; }
+            button { width: 100%; padding: 11px; background: #7AAFC5; color: white;
+                     border: none; border-radius: 4px; font-size: 15px;
+                     font-weight: bold; cursor: pointer; }
+            button:hover { background: #5B9AB5; }
+            .error { color: #D65C5C; font-size: 13px; text-align: center;
+                     margin-top: 12px; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>⚙️ AOS Admin</h1>
+            <p>Panel de Administración</p>
+            <form method="post" action="/login">
+                <label>Usuario</label>
+                <input name="usuario" type="text" placeholder="usuario" autofocus>
+                <label>Contraseña</label>
+                <input name="contrasena" type="password" placeholder="••••••••">
+                <button type="submit">Ingresar</button>
+            </form>
+            <div id="err"></div>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.post("/login")
+async def hacer_login(usuario: str = Form(...), contrasena: str = Form(...)):
+    if usuario == ADMIN_USER and contrasena == ADMIN_PASS:
+        response = RedirectResponse(url="/admin", status_code=302)
+        response.set_cookie("session", "ok", httponly=True)
+        return response
+    return RedirectResponse(url="/login?error=1", status_code=302)
+
+@app.get("/logout")
+def logout():
+    response = RedirectResponse(url="/login", status_code=302)
+    response.delete_cookie("session")
+    return response
 
 # ─────────────────────────────────────────────
 # ENDPOINTS ESP32
@@ -189,7 +239,7 @@ async def crear_interrupcion(data: InterrupcionModel):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
-# ENDPOINTS PACIENTES (ADMIN)
+# ENDPOINTS PACIENTES
 # ─────────────────────────────────────────────
 @app.get("/pacientes")
 def obtener_pacientes():
@@ -202,7 +252,9 @@ def obtener_pacientes():
     return rows
 
 @app.post("/pacientes")
-def crear_paciente(data: PacienteModel, admin=Depends(verificar_admin)):
+def crear_paciente(data: PacienteModel, request: Request):
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -221,7 +273,9 @@ def crear_paciente(data: PacienteModel, admin=Depends(verificar_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/pacientes/{paciente_id}")
-def editar_paciente(paciente_id: int, data: PacienteModel, admin=Depends(verificar_admin)):
+def editar_paciente(paciente_id: int, data: PacienteModel, request: Request):
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -239,7 +293,9 @@ def editar_paciente(paciente_id: int, data: PacienteModel, admin=Depends(verific
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/pacientes/{paciente_id}")
-def eliminar_paciente(paciente_id: int, admin=Depends(verificar_admin)):
+def eliminar_paciente(paciente_id: int, request: Request):
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -252,10 +308,12 @@ def eliminar_paciente(paciente_id: int, admin=Depends(verificar_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
-# ENDPOINTS USUARIOS (ADMIN)
+# ENDPOINTS USUARIOS
 # ─────────────────────────────────────────────
 @app.get("/usuarios")
-def obtener_usuarios(admin=Depends(verificar_admin)):
+def obtener_usuarios(request: Request):
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT id, usuario FROM usuarios ORDER BY id")
@@ -265,7 +323,9 @@ def obtener_usuarios(admin=Depends(verificar_admin)):
     return rows
 
 @app.post("/usuarios")
-def crear_usuario(data: UsuarioModel, admin=Depends(verificar_admin)):
+def crear_usuario(data: UsuarioModel, request: Request):
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -280,7 +340,9 @@ def crear_usuario(data: UsuarioModel, admin=Depends(verificar_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/usuarios/{usuario_id}")
-def editar_usuario(usuario_id: int, data: UsuarioModel, admin=Depends(verificar_admin)):
+def editar_usuario(usuario_id: int, data: UsuarioModel, request: Request):
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -294,7 +356,9 @@ def editar_usuario(usuario_id: int, data: UsuarioModel, admin=Depends(verificar_
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/usuarios/{usuario_id}")
-def eliminar_usuario(usuario_id: int, admin=Depends(verificar_admin)):
+def eliminar_usuario(usuario_id: int, request: Request):
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -367,10 +431,12 @@ def obtener_senales(interrupcion_id: int, tipo: str):
     return rows
 
 # ─────────────────────────────────────────────
-# PANEL DE ADMINISTRACIÓN
+# PANEL ADMIN
 # ─────────────────────────────────────────────
 @app.get("/admin", response_class=HTMLResponse)
-def admin_panel(admin=Depends(verificar_admin)):
+def admin_panel(request: Request):
+    if not verificar_sesion(request):
+        return RedirectResponse(url="/login", status_code=302)
     return """
     <!DOCTYPE html>
     <html lang="es">
@@ -383,69 +449,68 @@ def admin_panel(admin=Depends(verificar_admin)):
             .banner { background: #EEF5FB; padding: 14px 30px;
                       border-bottom: 1px solid #D4E8F3; display: flex;
                       align-items: center; justify-content: space-between; }
-            .banner h1 { font-family: 'Times New Roman', serif;
-                         font-size: 22px; color: #2C4A5A; }
-            .tabs { display: flex; background: #EEF5FB;
-                    border-bottom: 2px solid #D4E8F3; padding: 0 30px; }
+            .banner h1 { font-family: 'Times New Roman', serif; font-size: 22px; color: #2C4A5A; }
+            .banner-links a { color: #7AAFC5; font-size: 13px; margin-left: 20px; text-decoration: none; }
+            .tabs { display: flex; background: #EEF5FB; border-bottom: 2px solid #D4E8F3; padding: 0 30px; }
             .tab { padding: 12px 24px; cursor: pointer; font-weight: bold;
                    font-size: 13px; color: #5A7A8A; border-bottom: 3px solid transparent; }
             .tab.active { color: #7AAFC5; border-bottom: 3px solid #7AAFC5; }
             .content { padding: 24px 30px; }
             .section { display: none; }
             .section.active { display: block; }
-            .toolbar { display: flex; justify-content: space-between;
-                       align-items: center; margin-bottom: 16px; }
-            .search { background: #EEF5FB; border: 1px solid #D4E8F3;
-                      padding: 8px 14px; width: 300px; border-radius: 4px;
-                      font-size: 13px; color: #2C4A5A; }
+            .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+            .search { background: #EEF5FB; border: 1px solid #D4E8F3; padding: 8px 14px;
+                      width: 300px; border-radius: 4px; font-size: 13px; color: #2C4A5A; }
             .btn { padding: 8px 18px; border: none; border-radius: 4px;
                    cursor: pointer; font-size: 13px; font-weight: bold; }
             .btn-primary { background: #7AAFC5; color: white; }
             .btn-primary:hover { background: #5B9AB5; }
-            .btn-danger  { background: #D65C5C; color: white; font-size: 11px; padding: 5px 10px; }
-            .btn-edit    { background: #EEF5FB; color: #2C4A5A; font-size: 11px; padding: 5px 10px; border: 1px solid #D4E8F3; }
+            .btn-danger { background: #D65C5C; color: white; font-size: 11px; padding: 5px 10px; }
+            .btn-edit { background: #EEF5FB; color: #2C4A5A; font-size: 11px;
+                        padding: 5px 10px; border: 1px solid #D4E8F3; cursor: pointer; }
             table { width: 100%; border-collapse: collapse; }
-            th { background: #EEF5FB; color: #2C4A5A; padding: 10px;
-                 text-align: left; font-size: 13px; border-bottom: 2px solid #D4E8F3; }
+            th { background: #EEF5FB; color: #2C4A5A; padding: 10px; text-align: left;
+                 font-size: 13px; border-bottom: 2px solid #D4E8F3; }
             td { padding: 10px; border-bottom: 1px solid #D4E8F3; font-size: 13px; }
             tr:hover { background: #F5FAFD; }
-            .modal-bg { display: none; position: fixed; top: 0; left: 0;
-                        width: 100%; height: 100%; background: rgba(0,0,0,0.3);
-                        z-index: 100; justify-content: center; align-items: center; }
+            .modal-bg { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                        background: rgba(0,0,0,0.3); z-index: 100; justify-content: center; align-items: center; }
             .modal-bg.show { display: flex; }
-            .modal { background: white; border-radius: 8px; padding: 28px;
-                     width: 460px; box-shadow: 0 8px 32px rgba(44,74,90,0.15); }
+            .modal { background: white; border-radius: 8px; padding: 28px; width: 460px;
+                     box-shadow: 0 8px 32px rgba(44,74,90,0.15); }
             .modal h2 { font-family: 'Times New Roman', serif; color: #2C4A5A;
                         margin-bottom: 20px; font-size: 18px; }
             .form-group { margin-bottom: 14px; }
             .form-group label { display: block; font-size: 12px; color: #5A7A8A;
                                 margin-bottom: 4px; font-weight: bold; }
-            .form-group input, .form-group select {
-                width: 100%; padding: 8px 12px; border: 1px solid #D4E8F3;
-                border-radius: 4px; font-size: 13px; background: #EEF5FB;
-                color: #2C4A5A; }
+            .form-group input, .form-group select { width: 100%; padding: 8px 12px;
+                border: 1px solid #D4E8F3; border-radius: 4px; font-size: 13px;
+                background: #EEF5FB; color: #2C4A5A; }
             .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
             .modal-btns { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
-            .btn-cancel { background: #EEF5FB; color: #5A7A8A;
-                          border: 1px solid #D4E8F3; }
+            .btn-cancel { background: #EEF5FB; color: #5A7A8A; border: 1px solid #D4E8F3; }
             .badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; }
             .badge-ok   { background: #EEF8F2; color: #2E7D52; }
             .badge-warn { background: #FFF8EC; color: #B07020; }
             .badge-crit { background: #FFF0EE; color: #A02020; }
+            .toast { position: fixed; bottom: 30px; right: 30px; background: #2C4A5A;
+                     color: white; padding: 12px 24px; border-radius: 6px; font-size: 13px;
+                     display: none; z-index: 200; }
+            .toast.show { display: block; }
         </style>
     </head>
     <body>
         <div class="banner">
             <h1>⚙️ AOS — Panel de Administración</h1>
-            <a href="/dashboard" style="color:#7AAFC5; font-size:13px;">Ver Dashboard →</a>
+            <div class="banner-links">
+                <a href="/dashboard">Ver Dashboard →</a>
+                <a href="/logout">Cerrar sesión</a>
+            </div>
         </div>
-
         <div class="tabs">
             <div class="tab active" onclick="cambiarTab('pacientes')">👥 Pacientes</div>
             <div class="tab" onclick="cambiarTab('usuarios')">🔑 Usuarios</div>
         </div>
-
-        <!-- PACIENTES -->
         <div class="content">
             <div id="sec-pacientes" class="section active">
                 <div class="toolbar">
@@ -456,16 +521,13 @@ def admin_panel(admin=Depends(verificar_admin)):
                 <table>
                     <thead>
                         <tr>
-                            <th>Nombre</th><th>Fecha estudio</th><th>Edad</th>
-                            <th>Sexo</th><th>Enf. cardiovascular</th>
-                            <th>IMC</th><th>EPWORTH</th><th>Acciones</th>
+                            <th>Nombre</th><th>Fecha estudio</th><th>Edad</th><th>Sexo</th>
+                            <th>Enf. cardiovascular</th><th>IMC</th><th>EPWORTH</th><th>Acciones</th>
                         </tr>
                     </thead>
                     <tbody id="tbody-pacientes"></tbody>
                 </table>
             </div>
-
-            <!-- USUARIOS -->
             <div id="sec-usuarios" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Gestión de usuarios del sistema</span>
@@ -473,9 +535,7 @@ def admin_panel(admin=Depends(verificar_admin)):
                 </div>
                 <table>
                     <thead>
-                        <tr>
-                            <th>ID</th><th>Usuario</th><th>Acciones</th>
-                        </tr>
+                        <tr><th>ID</th><th>Usuario</th><th>Acciones</th></tr>
                     </thead>
                     <tbody id="tbody-usuarios"></tbody>
                 </table>
@@ -488,7 +548,7 @@ def admin_panel(admin=Depends(verificar_admin)):
                 <h2 id="modal-pac-titulo">Nuevo paciente</h2>
                 <input type="hidden" id="pac-id">
                 <div class="form-group">
-                    <label>Nombre completo</label>
+                    <label>Nombre completo *</label>
                     <input id="pac-nombre" placeholder="Ej: Juan Pérez García">
                 </div>
                 <div class="form-row">
@@ -543,11 +603,11 @@ def admin_panel(admin=Depends(verificar_admin)):
                 <h2 id="modal-usr-titulo">Nuevo usuario</h2>
                 <input type="hidden" id="usr-id">
                 <div class="form-group">
-                    <label>Nombre de usuario</label>
+                    <label>Nombre de usuario *</label>
                     <input id="usr-nombre" placeholder="Ej: doctor_lopez">
                 </div>
                 <div class="form-group">
-                    <label>Contraseña</label>
+                    <label>Contraseña *</label>
                     <input id="usr-pass" type="password" placeholder="Contraseña">
                 </div>
                 <div class="modal-btns">
@@ -557,11 +617,20 @@ def admin_panel(admin=Depends(verificar_admin)):
             </div>
         </div>
 
+        <div class="toast" id="toast"></div>
+
         <script>
             let pacientes = [];
 
+            function mostrarToast(msg) {
+                const t = document.getElementById('toast');
+                t.innerText = msg;
+                t.classList.add('show');
+                setTimeout(() => t.classList.remove('show'), 2500);
+            }
+
             function cambiarTab(tab) {
-                document.querySelectorAll('.tab').forEach((t,i) => {
+                document.querySelectorAll('.tab').forEach((t, i) => {
                     t.classList.toggle('active', (i===0&&tab==='pacientes')||(i===1&&tab==='usuarios'));
                 });
                 document.getElementById('sec-pacientes').classList.toggle('active', tab==='pacientes');
@@ -582,7 +651,8 @@ def admin_panel(admin=Depends(verificar_admin)):
                 datos.forEach(p => {
                     const epw = p.epworth >= 15 ? 'badge-crit' : p.epworth >= 10 ? 'badge-warn' : 'badge-ok';
                     const imc = p.imc >= 30 ? 'badge-crit' : p.imc >= 25 ? 'badge-warn' : 'badge-ok';
-                    tb.innerHTML += '<tr>' +
+                    const fila = document.createElement('tr');
+                    fila.innerHTML =
                         '<td><strong>' + p.nombre + '</strong></td>' +
                         '<td>' + (p.fecha_estudio||'--') + '</td>' +
                         '<td>' + (p.edad||'--') + '</td>' +
@@ -591,9 +661,12 @@ def admin_panel(admin=Depends(verificar_admin)):
                         '<td><span class="badge ' + imc + '">' + (p.imc||'--') + '</span></td>' +
                         '<td><span class="badge ' + epw + '">' + (p.epworth||'--') + '</span></td>' +
                         '<td>' +
-                            '<button class="btn btn-edit" onclick="editarPaciente(' + JSON.stringify(p).replace(/"/g,"'") + ')">✏️ Editar</button> ' +
-                            '<button class="btn btn-danger" onclick="eliminarPaciente(' + p.id + ')">🗑️ Eliminar</button>' +
-                        '</td></tr>';
+                            '<button class="btn btn-edit" id="edit-p-' + p.id + '">✏️ Editar</button> ' +
+                            '<button class="btn btn-danger" id="del-p-' + p.id + '">🗑️ Eliminar</button>' +
+                        '</td>';
+                    tb.appendChild(fila);
+                    document.getElementById('edit-p-' + p.id).onclick = () => editarPaciente(p);
+                    document.getElementById('del-p-' + p.id).onclick = () => eliminarPaciente(p.id);
                 });
             }
 
@@ -605,9 +678,13 @@ def admin_panel(admin=Depends(verificar_admin)):
             function abrirModalPaciente() {
                 document.getElementById('modal-pac-titulo').innerText = 'Nuevo paciente';
                 document.getElementById('pac-id').value = '';
-                ['pac-nombre','pac-fecha','pac-edad','pac-imc','pac-epworth'].forEach(id => document.getElementById(id).value = '');
+                document.getElementById('pac-nombre').value = '';
+                document.getElementById('pac-fecha').value = '';
+                document.getElementById('pac-edad').value = '';
                 document.getElementById('pac-sexo').value = '';
                 document.getElementById('pac-cardio').value = '';
+                document.getElementById('pac-imc').value = '';
+                document.getElementById('pac-epworth').value = '';
                 document.getElementById('modal-paciente').classList.add('show');
             }
 
@@ -625,9 +702,11 @@ def admin_panel(admin=Depends(verificar_admin)):
             }
 
             async function guardarPaciente() {
+                const nombre = document.getElementById('pac-nombre').value.trim();
+                if (!nombre) { alert('El nombre es obligatorio'); return; }
                 const id = document.getElementById('pac-id').value;
                 const body = {
-                    nombre: document.getElementById('pac-nombre').value,
+                    nombre: nombre,
                     fecha_estudio: document.getElementById('pac-fecha').value || null,
                     edad: parseInt(document.getElementById('pac-edad').value) || null,
                     sexo: document.getElementById('pac-sexo').value || null,
@@ -635,37 +714,49 @@ def admin_panel(admin=Depends(verificar_admin)):
                     imc: parseFloat(document.getElementById('pac-imc').value) || null,
                     epworth: parseInt(document.getElementById('pac-epworth').value) || null
                 };
-                const url = id ? '/pacientes/' + id : '/pacientes';
-                const method = id ? 'PUT' : 'POST';
-                await fetch(url, {
-                    method,
+                const res = await fetch(id ? '/pacientes/' + id : '/pacientes', {
+                    method: id ? 'PUT' : 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify(body)
                 });
-                cerrarModals();
-                cargarPacientes();
+                if (res.ok) {
+                    cerrarModals();
+                    mostrarToast(id ? '✅ Paciente actualizado' : '✅ Paciente agregado');
+                    cargarPacientes();
+                } else {
+                    const err = await res.json();
+                    alert('Error: ' + err.detail);
+                }
             }
 
             async function eliminarPaciente(id) {
-                if (!confirm('¿Eliminar este paciente?')) return;
-                await fetch('/pacientes/' + id, { method: 'DELETE' });
-                cargarPacientes();
+                if (!confirm('¿Eliminar este paciente? Esta acción no se puede deshacer.')) return;
+                const res = await fetch('/pacientes/' + id, { method: 'DELETE' });
+                if (res.ok) {
+                    mostrarToast('🗑️ Paciente eliminado');
+                    cargarPacientes();
+                }
             }
 
             // ── USUARIOS ──
             async function cargarUsuarios() {
                 const res = await fetch('/usuarios');
+                if (res.status === 401) { window.location.href = '/login'; return; }
                 const usuarios = await res.json();
                 const tb = document.getElementById('tbody-usuarios');
                 tb.innerHTML = '';
                 usuarios.forEach(u => {
-                    tb.innerHTML += '<tr>' +
+                    const fila = document.createElement('tr');
+                    fila.innerHTML =
                         '<td>' + u.id + '</td>' +
                         '<td><strong>' + u.usuario + '</strong></td>' +
                         '<td>' +
-                            '<button class="btn btn-edit" onclick="editarUsuario(' + u.id + ',\'' + u.usuario + '\')">✏️ Editar</button> ' +
-                            '<button class="btn btn-danger" onclick="eliminarUsuario(' + u.id + ')">🗑️ Eliminar</button>' +
-                        '</td></tr>';
+                            '<button class="btn btn-edit" id="edit-u-' + u.id + '">✏️ Editar</button> ' +
+                            '<button class="btn btn-danger" id="del-u-' + u.id + '">🗑️ Eliminar</button>' +
+                        '</td>';
+                    tb.appendChild(fila);
+                    document.getElementById('edit-u-' + u.id).onclick = () => editarUsuario(u.id, u.usuario);
+                    document.getElementById('del-u-' + u.id).onclick = () => eliminarUsuario(u.id);
                 });
             }
 
@@ -686,26 +777,32 @@ def admin_panel(admin=Depends(verificar_admin)):
             }
 
             async function guardarUsuario() {
+                const usuario = document.getElementById('usr-nombre').value.trim();
+                const contrasena = document.getElementById('usr-pass').value.trim();
+                if (!usuario || !contrasena) { alert('Usuario y contraseña son obligatorios'); return; }
                 const id = document.getElementById('usr-id').value;
-                const body = {
-                    usuario: document.getElementById('usr-nombre').value,
-                    contrasena: document.getElementById('usr-pass').value
-                };
-                const url = id ? '/usuarios/' + id : '/usuarios';
-                const method = id ? 'PUT' : 'POST';
-                await fetch(url, {
-                    method,
+                const res = await fetch(id ? '/usuarios/' + id : '/usuarios', {
+                    method: id ? 'PUT' : 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(body)
+                    body: JSON.stringify({ usuario, contrasena })
                 });
-                cerrarModals();
-                cargarUsuarios();
+                if (res.ok) {
+                    cerrarModals();
+                    mostrarToast(id ? '✅ Usuario actualizado' : '✅ Usuario creado');
+                    cargarUsuarios();
+                } else {
+                    const err = await res.json();
+                    alert('Error: ' + err.detail);
+                }
             }
 
             async function eliminarUsuario(id) {
                 if (!confirm('¿Eliminar este usuario?')) return;
-                await fetch('/usuarios/' + id, { method: 'DELETE' });
-                cargarUsuarios();
+                const res = await fetch('/usuarios/' + id, { method: 'DELETE' });
+                if (res.ok) {
+                    mostrarToast('🗑️ Usuario eliminado');
+                    cargarUsuarios();
+                }
             }
 
             function cerrarModals() {
@@ -735,12 +832,11 @@ def dashboard():
                       align-items: center; justify-content: space-between; }
             .banner h1 { font-family: 'Times New Roman', serif; font-size: 22px; color: #2C4A5A; }
             .content { padding: 20px 30px; }
-            .search-bar { background: #EEF5FB; border: 1px solid #D4E8F3;
-                          padding: 8px 14px; width: 400px; border-radius: 4px;
-                          font-size: 14px; color: #2C4A5A; }
+            .search-bar { background: #EEF5FB; border: 1px solid #D4E8F3; padding: 8px 14px;
+                          width: 400px; border-radius: 4px; font-size: 14px; color: #2C4A5A; }
             table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-            th { background: #EEF5FB; color: #2C4A5A; padding: 10px;
-                 text-align: left; font-size: 13px; border-bottom: 2px solid #D4E8F3; }
+            th { background: #EEF5FB; color: #2C4A5A; padding: 10px; text-align: left;
+                 font-size: 13px; border-bottom: 2px solid #D4E8F3; }
             td { padding: 10px; border-bottom: 1px solid #D4E8F3; font-size: 13px; }
             tr:hover { background: #F5FAFD; }
             .badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; }
@@ -764,8 +860,7 @@ def dashboard():
                 <thead>
                     <tr>
                         <th>Nombre</th><th>Fecha estudio</th><th>Edad</th>
-                        <th>Sexo</th><th>Enf. cardiovascular</th>
-                        <th>IMC</th><th>EPWORTH</th>
+                        <th>Sexo</th><th>Enf. cardiovascular</th><th>IMC</th><th>EPWORTH</th>
                     </tr>
                 </thead>
                 <tbody id="cuerpo"></tbody>
@@ -808,5 +903,5 @@ def dashboard():
 @app.get("/")
 def home():
     return {"mensaje": "API AOS activa", "endpoints": [
-        "/dashboard", "/admin", "/pacientes", "/senales", "/interrupciones"
+        "/dashboard", "/admin", "/login"
     ]}
