@@ -13,7 +13,7 @@ def get_db_connection():
         user=os.getenv("MYSQL_USER"),
         password=os.getenv("MYSQL_PASSWORD"),
         database=os.getenv("MYSQL_DATABASE"),
-        port=int(os.getenv("MYSQL_PORT", 3306))
+        port=int(os.getenv("MYSQL_PORT") or 3306)
     )
 
 @app.on_event("startup")
@@ -27,12 +27,7 @@ def startup_event():
                 tiempo_ms BIGINT,
                 ecg FLOAT,
                 spo2 FLOAT,
-                acc_x FLOAT,
-                acc_y FLOAT,
                 acc_z FLOAT,
-                giro_x FLOAT,
-                giro_y FLOAT,
-                giro_z FLOAT,
                 flujo_respiratorio FLOAT,
                 fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -48,12 +43,7 @@ class LecturaSensor(BaseModel):
     tiempo_ms: int
     ecg: float
     spo2: float
-    acc_x: float
-    acc_y: float
     acc_z: float
-    giro_x: float
-    giro_y: float
-    giro_z: float
     flujo_respiratorio: float
 
 @app.post("/subir-datos")
@@ -62,10 +52,9 @@ async def recibir_datos(lecturas: List[LecturaSensor]):
         conn = get_db_connection()
         cursor = conn.cursor()
         sql = """INSERT INTO datos_sensores 
-                 (tiempo_ms, ecg, spo2, acc_x, acc_y, acc_z, giro_x, giro_y, giro_z, flujo_respiratorio) 
-                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
-        valores = [(l.tiempo_ms, l.ecg, l.spo2, l.acc_x, l.acc_y, l.acc_z,
-                    l.giro_x, l.giro_y, l.giro_z, l.flujo_respiratorio) for l in lecturas]
+                 (tiempo_ms, ecg, spo2, acc_z, flujo_respiratorio) 
+                 VALUES (%s, %s, %s, %s, %s)"""
+        valores = [(l.tiempo_ms, l.ecg, l.spo2, l.acc_z, l.flujo_respiratorio) for l in lecturas]
         cursor.executemany(sql, valores)
         conn.commit()
         cursor.close()
@@ -133,9 +122,7 @@ def dashboard():
             <thead>
                 <tr>
                     <th>ID</th><th>Tiempo (ms)</th><th>ECG</th><th>SpO2</th>
-                    <th>Acc X</th><th>Acc Y</th><th>Acc Z</th>
-                    <th>Giro X</th><th>Giro Y</th><th>Giro Z</th>
-                    <th>Flujo Resp.</th><th>Fecha</th>
+                    <th>Acc Z</th><th>Flujo Resp.</th><th>Fecha</th>
                 </tr>
             </thead>
             <tbody id="cuerpo"></tbody>
@@ -161,12 +148,7 @@ def dashboard():
                         '<td>' + d.tiempo_ms + '</td>' +
                         '<td>' + d.ecg + '</td>' +
                         '<td>' + d.spo2 + '</td>' +
-                        '<td>' + d.acc_x + '</td>' +
-                        '<td>' + d.acc_y + '</td>' +
                         '<td>' + d.acc_z + '</td>' +
-                        '<td>' + d.giro_x + '</td>' +
-                        '<td>' + d.giro_y + '</td>' +
-                        '<td>' + d.giro_z + '</td>' +
                         '<td>' + d.flujo_respiratorio + '</td>' +
                         '<td>' + d.fecha_registro + '</td>' +
                         '</tr>';
