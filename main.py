@@ -188,6 +188,30 @@ async def hacer_login(usuario: str = Form(...), contrasena: str = Form(...)):
         return response
     return RedirectResponse(url="/login?error=1", status_code=302)
 
+class LoginRequest(BaseModel):
+    usuario: str
+    contrasena: str
+
+@app.post("/api/login")
+def api_login_json(data: LoginRequest):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, usuario FROM usuarios WHERE usuario=%s AND contrasena=%s",
+            (data.usuario, data.contrasena)
+        )
+        user = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if user:
+            return {"status": "ok", "usuario": user}
+        raise HTTPException(status_code=401, detail="Credenciales incorrectas")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/logout")
 def logout():
     response = RedirectResponse(url="/login", status_code=302)
