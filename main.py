@@ -4,12 +4,12 @@ from pydantic import BaseModel
 from typing import List, Optional
 import mysql.connector
 import os
-
+ 
 app = FastAPI()
-
+ 
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
-
+ 
 def get_db_connection():
     return mysql.connector.connect(
         host=os.getenv("MYSQL_HOST"),
@@ -18,10 +18,10 @@ def get_db_connection():
         database=os.getenv("MYSQL_DATABASE"),
         port=int(os.getenv("MYSQL_PORT") or 3306)
     )
-
+ 
 def verificar_sesion(request: Request):
     return request.cookies.get("session") == "ok"
-
+ 
 # ─────────────────────────────────────────────
 # CREAR TABLAS AL INICIAR
 # ─────────────────────────────────────────────
@@ -100,7 +100,7 @@ def startup_event():
         print("✅ Tablas verificadas/creadas con éxito")
     except Exception as e:
         print(f"❌ Error al crear tablas: {e}")
-
+ 
 # ─────────────────────────────────────────────
 # MODELOS
 # ─────────────────────────────────────────────
@@ -109,7 +109,7 @@ class SenalESP32(BaseModel):
     tipo_senal: str
     timestamp_ms: int
     valor: float
-
+ 
 class InterrupcionModel(BaseModel):
     hora_sesion_id: int
     numero_interrupcion: int
@@ -117,7 +117,7 @@ class InterrupcionModel(BaseModel):
     duracion_segundos: float
     spo2: float
     frecuencia_cardiaca: float
-
+ 
 class PacienteModel(BaseModel):
     nombre: str
     fecha_estudio: Optional[str] = None
@@ -126,11 +126,22 @@ class PacienteModel(BaseModel):
     enfermedad_cardiovascular: Optional[str] = None
     imc: Optional[float] = None
     epworth: Optional[int] = None
-
+ 
 class UsuarioModel(BaseModel):
     usuario: str
     contrasena: str
-
+ 
+class DatosESP32(BaseModel):
+    paciente: str          # nombre completo del paciente
+    hora: str              # HH:MM:SS — hora exacta de la apnea
+    spo2: float            # saturación de oxígeno (%)
+    ecg: float             # valor ECG filtrado (ADS1292R)
+    acce_z: float          # movimiento torácico — eje Z del MPU6050
+    flujo: float           # flujo respiratorio — MPX5010DP
+    no_apnea: int          # número de apnea dentro de la hora actual
+    duracion: float        # duración del evento en segundos
+ 
+ 
 # ─────────────────────────────────────────────
 # LOGIN ADMIN
 # ─────────────────────────────────────────────
@@ -179,7 +190,7 @@ def login_page():
     </body>
     </html>
     """
-
+ 
 @app.post("/login")
 async def hacer_login(usuario: str = Form(...), contrasena: str = Form(...)):
     if usuario == ADMIN_USER and contrasena == ADMIN_PASS:
@@ -187,11 +198,11 @@ async def hacer_login(usuario: str = Form(...), contrasena: str = Form(...)):
         response.set_cookie("session", "ok", httponly=True)
         return response
     return RedirectResponse(url="/login?error=1", status_code=302)
-
+ 
 class LoginRequest(BaseModel):
     usuario: str
     contrasena: str
-
+ 
 @app.post("/api/login")
 def api_login_json(data: LoginRequest):
     try:
@@ -211,17 +222,17 @@ def api_login_json(data: LoginRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+ 
 @app.get("/logout")
 def logout():
     response = RedirectResponse(url="/login", status_code=302)
     response.delete_cookie("session")
     return response
-
+ 
 # ─────────────────────────────────────────────
 # ENDPOINTS ESP32
 # ─────────────────────────────────────────────
-
+ 
 @app.get("/datos-sensores")
 def obtener_datos_sensores(request: Request):
     if not verificar_sesion(request):
@@ -249,7 +260,7 @@ def obtener_datos_sensores(request: Request):
         return rows
     except Exception as e:
         return {"error": str(e)}
-
+ 
 @app.post("/senales")
 async def subir_senales(senales: List[SenalESP32]):
     try:
@@ -264,7 +275,7 @@ async def subir_senales(senales: List[SenalESP32]):
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+ 
 @app.post("/interrupciones")
 async def crear_interrupcion(data: InterrupcionModel):
     try:
@@ -281,7 +292,7 @@ async def crear_interrupcion(data: InterrupcionModel):
         return {"status": "success", "id": new_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+ 
 # ─────────────────────────────────────────────
 # ENDPOINTS PACIENTES
 # ─────────────────────────────────────────────
@@ -294,7 +305,7 @@ def obtener_pacientes():
     cursor.close()
     conn.close()
     return rows
-
+ 
 @app.post("/pacientes")
 def crear_paciente(data: PacienteModel, request: Request):
     if not verificar_sesion(request):
@@ -307,7 +318,7 @@ def crear_paciente(data: PacienteModel, request: Request):
     cursor.close()
     conn.close()
     return {"status": "success"}
-
+ 
 @app.put("/pacientes/{paciente_id}")
 def editar_paciente(paciente_id: int, data: PacienteModel, request: Request):
     if not verificar_sesion(request):
@@ -320,7 +331,7 @@ def editar_paciente(paciente_id: int, data: PacienteModel, request: Request):
     cursor.close()
     conn.close()
     return {"status": "success"}
-
+ 
 @app.delete("/pacientes/{paciente_id}")
 def eliminar_paciente(paciente_id: int, request: Request):
     if not verificar_sesion(request):
@@ -332,7 +343,7 @@ def eliminar_paciente(paciente_id: int, request: Request):
     cursor.close()
     conn.close()
     return {"status": "success"}
-
+ 
 # ─────────────────────────────────────────────
 # ENDPOINTS USUARIOS
 # ─────────────────────────────────────────────
@@ -347,7 +358,7 @@ def obtener_usuarios(request: Request):
     cursor.close()
     conn.close()
     return rows
-
+ 
 @app.post("/usuarios")
 def crear_usuario(data: UsuarioModel, request: Request):
     if not verificar_sesion(request):
@@ -359,7 +370,7 @@ def crear_usuario(data: UsuarioModel, request: Request):
     cursor.close()
     conn.close()
     return {"status": "success"}
-
+ 
 @app.delete("/usuarios/{usuario_id}")
 def eliminar_usuario(usuario_id: int, request: Request):
     if not verificar_sesion(request):
@@ -371,7 +382,116 @@ def eliminar_usuario(usuario_id: int, request: Request):
     cursor.close()
     conn.close()
     return {"status": "success"}
-
+ 
+ 
+# ─────────────────────────────────────────────
+# ENDPOINT ESP32 — RECEPCIÓN UNIFICADA
+# ─────────────────────────────────────────────
+# Recibe un JSON plano desde el ESP32 y lo distribuye
+# en la estructura relacional de la base de datos:
+#   pacientes → sesiones → horas_sesion → interrupciones → senales_esp32
+#
+# Lógica de resolución automática:
+#   1. Busca el paciente por nombre; si no existe, lo crea.
+#   2. Busca la sesión de HOY para ese paciente; si no existe, la crea.
+#   3. Busca la hora_sesion correspondiente (según la hora del evento);
+#      si no existe, la crea con hora_inicio y hora_fin del bloque de 1 h.
+#   4. Inserta la interrupción (apnea) con todos sus parámetros.
+#   5. Inserta acce_z y flujo como señales individuales en senales_esp32.
+#
+# No requiere autenticación para permitir el acceso directo desde el ESP32.
+# ─────────────────────────────────────────────
+@app.post("/subir-datos")
+async def subir_datos(datos: DatosESP32):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+ 
+        # ── 1. Paciente: buscar por nombre o crear ────────────────────────────
+        cursor.execute("SELECT id FROM pacientes WHERE nombre = %s LIMIT 1", (datos.paciente,))
+        fila = cursor.fetchone()
+        if fila:
+            paciente_id = fila[0]
+        else:
+            from datetime import date
+            cursor.execute(
+                "INSERT INTO pacientes (nombre, fecha_estudio) VALUES (%s, %s)",
+                (datos.paciente, date.today().isoformat())
+            )
+            conn.commit()
+            paciente_id = cursor.lastrowid
+ 
+        # ── 2. Sesión: buscar la de hoy o crear ──────────────────────────────
+        cursor.execute(
+            "SELECT id FROM sesiones WHERE paciente_id = %s AND DATE(fecha) = CURDATE() LIMIT 1",
+            (paciente_id,)
+        )
+        fila = cursor.fetchone()
+        if fila:
+            sesion_id = fila[0]
+        else:
+            cursor.execute(
+                "INSERT INTO sesiones (paciente_id) VALUES (%s)",
+                (paciente_id,)
+            )
+            conn.commit()
+            sesion_id = cursor.lastrowid
+ 
+        # ── 3. Hora de sesión: bloque de 1 h según la hora del evento ─────────
+        # datos.hora tiene formato "HH:MM:SS"
+        partes    = datos.hora.split(":")
+        hora_num  = int(partes[0])              # 0-23
+        hora_ini  = f"{hora_num:02d}:00:00"
+        hora_fin  = f"{(hora_num + 1) % 24:02d}:00:00"
+ 
+        cursor.execute(
+            "SELECT id FROM horas_sesion WHERE sesion_id = %s AND numero_hora = %s LIMIT 1",
+            (sesion_id, hora_num)
+        )
+        fila = cursor.fetchone()
+        if fila:
+            hora_sesion_id = fila[0]
+        else:
+            cursor.execute(
+                "INSERT INTO horas_sesion (sesion_id, numero_hora, hora_inicio, hora_fin) VALUES (%s, %s, %s, %s)",
+                (sesion_id, hora_num, hora_ini, hora_fin)
+            )
+            conn.commit()
+            hora_sesion_id = cursor.lastrowid
+ 
+        # ── 4. Interrupción (apnea) ───────────────────────────────────────────
+        cursor.execute("""
+            INSERT INTO interrupciones
+                (hora_sesion_id, numero_interrupcion, hora_detectada, duracion_segundos, spo2, frecuencia_cardiaca)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (hora_sesion_id, datos.no_apnea, datos.hora, datos.duracion, datos.spo2, datos.ecg))
+        conn.commit()
+        interrupcion_id = cursor.lastrowid
+ 
+        # ── 5. Señales individuales: acce_z y flujo ───────────────────────────
+        timestamp_ms = int(hora_num * 3600000)   # estimado desde la hora del evento
+        cursor.executemany(
+            "INSERT INTO senales_esp32 (interrupcion_id, tipo_senal, timestamp_ms, valor) VALUES (%s, %s, %s, %s)",
+            [
+                (interrupcion_id, "acce_z", timestamp_ms, datos.acce_z),
+                (interrupcion_id, "flujo",  timestamp_ms, datos.flujo),
+            ]
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+ 
+        return {
+            "status": "success",
+            "paciente_id":     paciente_id,
+            "sesion_id":       sesion_id,
+            "hora_sesion_id":  hora_sesion_id,
+            "interrupcion_id": interrupcion_id
+        }
+ 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+ 
 # ─────────────────────────────────────────────
 # PANEL ADMIN
 # ─────────────────────────────────────────────
@@ -442,7 +562,7 @@ def admin_panel(request: Request):
                     <tbody id="tbody-pacientes"></tbody>
                 </table>
             </div>
-
+ 
             <div id="sec-usuarios" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Gestión de usuarios</span>
@@ -453,7 +573,7 @@ def admin_panel(request: Request):
                     <tbody id="tbody-usuarios"></tbody>
                 </table>
             </div>
-
+ 
             <div id="sec-monitoreo" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Registros históricos enviados por ESP32 (Solo lectura)</span>
@@ -467,7 +587,7 @@ def admin_panel(request: Request):
                 </table>
             </div>
         </div>
-
+ 
         <div class="modal-bg" id="modal-paciente">
             <div class="modal">
                 <h2 id="modal-pac-titulo">Paciente</h2>
@@ -491,7 +611,7 @@ def admin_panel(request: Request):
                 </div>
             </div>
         </div>
-
+ 
         <div class="modal-bg" id="modal-usuario">
             <div class="modal">
                 <h2>Nuevo Usuario</h2>
@@ -500,18 +620,18 @@ def admin_panel(request: Request):
                 <div style="text-align:right;"><button class="btn" onclick="cerrarModals()">Cancelar</button><button class="btn btn-primary" onclick="guardarUsuario()">Guardar</button></div>
             </div>
         </div>
-
+ 
         <div class="toast" id="toast"></div>
-
+ 
         <script>
             let pacientes = [];
-
+ 
             function mostrarToast(msg) {
                 const t = document.getElementById('toast');
                 t.innerText = msg; t.classList.add('show');
                 setTimeout(() => t.classList.remove('show'), 2500);
             }
-
+ 
             function cambiarTab(tab) {
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
@@ -521,13 +641,13 @@ def admin_panel(request: Request):
                 if(tab === 'usuarios') cargarUsuarios();
                 if(tab === 'monitoreo') cargarMonitoreo();
             }
-
+ 
             async function cargarPacientes() {
                 const res = await fetch('/pacientes');
                 pacientes = await res.json();
                 mostrarPacientes(pacientes);
             }
-
+ 
             function mostrarPacientes(datos) {
                 const tb = document.getElementById('tbody-pacientes');
                 tb.innerHTML = datos.map(p => `
@@ -545,12 +665,12 @@ def admin_panel(request: Request):
                     </tr>
                 `).join('');
             }
-
+ 
             function filtrarPacientes() {
                 const q = document.getElementById('buscar-pac').value.toLowerCase();
                 mostrarPacientes(pacientes.filter(p => p.nombre.toLowerCase().includes(q)));
             }
-
+ 
             async function cargarMonitoreo() {
                 const res = await fetch('/datos-sensores');
                 const datos = await res.json();
@@ -567,7 +687,7 @@ def admin_panel(request: Request):
                     </tr>
                 `).join('');
             }
-
+ 
             async function cargarUsuarios() {
                 const res = await fetch('/usuarios');
                 const data = await res.json();
@@ -575,11 +695,11 @@ def admin_panel(request: Request):
                     <tr><td>${u.id}</td><td>${u.usuario}</td><td><button class="btn btn-danger" onclick="eliminarUsuario(${u.id})">🗑️</button></td></tr>
                 `).join('');
             }
-
+ 
             function abrirModalPaciente() { document.getElementById('pac-id').value=''; document.getElementById('modal-paciente').classList.add('show'); }
             function abrirModalUsuario() { document.getElementById('modal-usuario').classList.add('show'); }
             function cerrarModals() { document.querySelectorAll('.modal-bg').forEach(m => m.classList.remove('show')); }
-
+ 
             function editarPaciente(p) {
                 document.getElementById('pac-id').value = p.id;
                 document.getElementById('pac-nombre').value = p.nombre;
@@ -591,7 +711,7 @@ def admin_panel(request: Request):
                 document.getElementById('pac-epworth').value = p.epworth;
                 document.getElementById('modal-paciente').classList.add('show');
             }
-
+ 
             async function guardarPaciente() {
                 const id = document.getElementById('pac-id').value;
                 const body = {
@@ -610,7 +730,7 @@ def admin_panel(request: Request):
                 });
                 cerrarModals(); cargarPacientes(); mostrarToast('Hecho');
             }
-
+ 
             async function eliminarPaciente(id) { if(confirm('¿Seguro?')) { await fetch('/pacientes/'+id, {method:'DELETE'}); cargarPacientes(); } }
             async function eliminarUsuario(id) { if(confirm('¿Seguro?')) { await fetch('/usuarios/'+id, {method:'DELETE'}); cargarUsuarios(); } }
             async function guardarUsuario() {
@@ -621,7 +741,7 @@ def admin_panel(request: Request):
                 });
                 cerrarModals(); cargarUsuarios();
             }
-
+ 
             window.onload = cargarPacientes;
         </script>
     </body>
