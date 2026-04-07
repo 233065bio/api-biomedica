@@ -4,12 +4,13 @@ from pydantic import BaseModel
 from typing import List, Optional
 import mysql.connector
 import os
- 
+import bcrypt
+
 app = FastAPI()
- 
+
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
- 
+
 def get_db_connection():
     return mysql.connector.connect(
         host=os.getenv("MYSQL_HOST"),
@@ -18,10 +19,23 @@ def get_db_connection():
         database=os.getenv("MYSQL_DATABASE"),
         port=int(os.getenv("MYSQL_PORT") or 3306)
     )
- 
+
 def verificar_sesion(request: Request):
     return request.cookies.get("session") == "ok"
- 
+
+def hash_password(plain: str) -> str:
+    """Genera un hash bcrypt de la contraseña."""
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+
+def check_password(plain: str, hashed: str) -> bool:
+    """Verifica si la contraseña coincide con el hash.
+    También acepta contraseñas en texto plano (migración gradual)."""
+    try:
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except Exception:
+        # Soporte de migración: contraseñas viejas en texto plano
+        return plain == hashed
+
 # ─────────────────────────────────────────────
 # CREAR TABLAS AL INICIAR
 # ─────────────────────────────────────────────
@@ -90,17 +104,22 @@ def startup_event():
                 FOREIGN KEY (interrupcion_id) REFERENCES interrupciones(id)
             )
         """)
-        cursor.execute("""
-            INSERT IGNORE INTO usuarios (usuario, contrasena)
-            VALUES ('admin', 'admin123')
-        """)
+
+        # Insertar usuario admin si no existe (con hash bcrypt)
+        cursor.execute("SELECT id FROM usuarios WHERE usuario = 'admin'")
+        if not cursor.fetchone():
+            hashed = hash_password("admin123")
+            cursor.execute(
+                "INSERT INTO usuarios (usuario, contrasena) VALUES ('admin', %s)",
+                (hashed,)
+            )
         conn.commit()
         cursor.close()
         conn.close()
         print("✅ Tablas verificadas/creadas con éxito")
     except Exception as e:
         print(f"❌ Error al crear tablas: {e}")
- 
+
 # ─────────────────────────────────────────────
 # MODELOS
 # ─────────────────────────────────────────────
@@ -109,7 +128,7 @@ class SenalESP32(BaseModel):
     tipo_senal: str
     timestamp_ms: int
     valor: float
- 
+
 class InterrupcionModel(BaseModel):
     hora_sesion_id: int
     numero_interrupcion: int
@@ -117,7 +136,7 @@ class InterrupcionModel(BaseModel):
     duracion_segundos: float
     spo2: float
     frecuencia_cardiaca: float
- 
+
 class PacienteModel(BaseModel):
     nombre: str
     fecha_estudio: Optional[str] = None
@@ -126,59 +145,64 @@ class PacienteModel(BaseModel):
     enfermedad_cardiovascular: Optional[str] = None
     imc: Optional[float] = None
     epworth: Optional[int] = None
- 
+
 class UsuarioModel(BaseModel):
     usuario: str
     contrasena: str
- 
+
 class DatosESP32(BaseModel):
-    paciente: str          # nombre completo del paciente
-    hora: str              # HH:MM:SS — hora exacta de la apnea
-    spo2: float            # saturación de oxígeno (%)
-    ecg: float             # valor ECG filtrado (ADS1292R)
-    acce_z: float          # movimiento torácico — eje Z del MPU6050
-    flujo: float           # flujo respiratorio — MPX5010DP
-    no_apnea: int          # número de apnea dentro de la hora actual
-    duracion: float        # duración del evento en segundos
- 
- 
+    paciente: str
+    hora: str
+    spo2: float
+    ecg: float
+    acce_z: float
+    flujo: float
+    no_apnea: int
+    duracion: float
+
+class LoginRequest(BaseModel):
+    usuario: str
+    contrasena: str
+
 # ─────────────────────────────────────────────
 # LOGIN ADMIN
 # ─────────────────────────────────────────────
 @app.get("/login", response_class=HTMLResponse)
-def login_page():
-    return """
+def login_page(error: Optional[str] = None):
+    error_html = '<p style="color:#D65C5C; text-align:center; font-size:13px; margin-bottom:12px;">Usuario o contraseña incorrectos</p>' if error else ''
+    return f"""
     <!DOCTYPE html>
     <html lang="es">
     <head>
         <meta charset="UTF-8">
         <title>AOS — Login</title>
         <style>
-            * { box-sizing: border-box; margin: 0; padding: 0; }
-            body { font-family: Arial, sans-serif; background: #EEF5FB;
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+            body {{ font-family: Arial, sans-serif; background: #EEF5FB;
                    display: flex; justify-content: center; align-items: center;
-                   height: 100vh; }
-            .card { background: white; border-radius: 10px; padding: 40px;
+                   height: 100vh; }}
+            .card {{ background: white; border-radius: 10px; padding: 40px;
                     width: 380px; box-shadow: 0 8px 32px rgba(44,74,90,0.12);
-                    border: 1px solid #D4E8F3; }
-            h1 { font-family: 'Times New Roman', serif; color: #2C4A5A;
-                 text-align: center; margin-bottom: 8px; font-size: 24px; }
-            p { text-align: center; color: #5A7A8A; font-size: 13px; margin-bottom: 28px; }
-            label { display: block; font-size: 12px; color: #5A7A8A;
-                    font-weight: bold; margin-bottom: 4px; }
-            input { width: 100%; padding: 10px 14px; border: 1px solid #D4E8F3;
+                    border: 1px solid #D4E8F3; }}
+            h1 {{ font-family: 'Times New Roman', serif; color: #2C4A5A;
+                 text-align: center; margin-bottom: 8px; font-size: 24px; }}
+            p {{ text-align: center; color: #5A7A8A; font-size: 13px; margin-bottom: 28px; }}
+            label {{ display: block; font-size: 12px; color: #5A7A8A;
+                    font-weight: bold; margin-bottom: 4px; }}
+            input {{ width: 100%; padding: 10px 14px; border: 1px solid #D4E8F3;
                     border-radius: 4px; font-size: 14px; background: #EEF5FB;
-                    color: #2C4A5A; margin-bottom: 16px; }
-            button { width: 100%; padding: 11px; background: #7AAFC5; color: white;
+                    color: #2C4A5A; margin-bottom: 16px; }}
+            button {{ width: 100%; padding: 11px; background: #7AAFC5; color: white;
                      border: none; border-radius: 4px; font-size: 15px;
-                     font-weight: bold; cursor: pointer; }
-            button:hover { background: #5B9AB5; }
+                     font-weight: bold; cursor: pointer; }}
+            button:hover {{ background: #5B9AB5; }}
         </style>
     </head>
     <body>
         <div class="card">
             <h1>⚙️ AOS Admin</h1>
             <p>Panel de Administración</p>
+            {error_html}
             <form method="post" action="/login">
                 <label>Usuario</label>
                 <input name="usuario" type="text" placeholder="usuario" autofocus>
@@ -190,49 +214,78 @@ def login_page():
     </body>
     </html>
     """
- 
+
 @app.post("/login")
 async def hacer_login(usuario: str = Form(...), contrasena: str = Form(...)):
+    """
+    Login unificado: verifica primero contra variable de entorno (admin),
+    luego contra la base de datos. Compatible con contraseñas hasheadas y texto plano.
+    """
+    # 1. Verificar contra variables de entorno (admin del sistema)
     if usuario == ADMIN_USER and contrasena == ADMIN_PASS:
         response = RedirectResponse(url="/admin", status_code=302)
-        response.set_cookie("session", "ok", httponly=True)
+        response.set_cookie("session", "ok", httponly=True, samesite="lax")
         return response
-    return RedirectResponse(url="/login?error=1", status_code=302)
- 
-class LoginRequest(BaseModel):
-    usuario: str
-    contrasena: str
- 
-@app.post("/api/login")
-def api_login_json(data: LoginRequest):
+
+    # 2. Verificar contra la base de datos
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            "SELECT id, usuario FROM usuarios WHERE usuario=%s AND contrasena=%s",
-            (data.usuario, data.contrasena)
+            "SELECT id, contrasena FROM usuarios WHERE usuario = %s",
+            (usuario,)
         )
         user = cursor.fetchone()
         cursor.close()
         conn.close()
-        if user:
-            return {"status": "ok", "usuario": user}
+
+        if user and check_password(contrasena, user["contrasena"]):
+            response = RedirectResponse(url="/admin", status_code=302)
+            response.set_cookie("session", "ok", httponly=True, samesite="lax")
+            return response
+    except Exception as e:
+        print(f"Error en login BD: {e}")
+
+    return RedirectResponse(url="/login?error=1", status_code=302)
+
+
+@app.post("/api/login")
+def api_login_json(data: LoginRequest):
+    """Login JSON para apps móviles / ESP32 / clientes externos."""
+    # Verificar admin de entorno
+    if data.usuario == ADMIN_USER and data.contrasena == ADMIN_PASS:
+        return {"status": "ok", "usuario": {"id": 0, "usuario": ADMIN_USER}}
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, usuario, contrasena FROM usuarios WHERE usuario = %s",
+            (data.usuario,)
+        )
+        user = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if user and check_password(data.contrasena, user["contrasena"]):
+            return {"status": "ok", "usuario": {"id": user["id"], "usuario": user["usuario"]}}
+
         raise HTTPException(status_code=401, detail="Credenciales incorrectas")
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
- 
+
+
 @app.get("/logout")
 def logout():
     response = RedirectResponse(url="/login", status_code=302)
     response.delete_cookie("session")
     return response
- 
+
 # ─────────────────────────────────────────────
 # ENDPOINTS ESP32
 # ─────────────────────────────────────────────
- 
 @app.get("/datos-sensores")
 def obtener_datos_sensores(request: Request):
     if not verificar_sesion(request):
@@ -241,7 +294,7 @@ def obtener_datos_sensores(request: Request):
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
         query = """
-            SELECT 
+            SELECT
                 p.nombre AS paciente_nombre,
                 i.hora_detectada, i.spo2, i.frecuencia_cardiaca AS ecg,
                 i.duracion_segundos AS duracion_apnea, i.numero_interrupcion AS numero_apnea,
@@ -260,7 +313,7 @@ def obtener_datos_sensores(request: Request):
         return rows
     except Exception as e:
         return {"error": str(e)}
- 
+
 @app.post("/senales")
 async def subir_senales(senales: List[SenalESP32]):
     try:
@@ -275,7 +328,7 @@ async def subir_senales(senales: List[SenalESP32]):
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
- 
+
 @app.post("/interrupciones")
 async def crear_interrupcion(data: InterrupcionModel):
     try:
@@ -292,7 +345,7 @@ async def crear_interrupcion(data: InterrupcionModel):
         return {"status": "success", "id": new_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
- 
+
 # ─────────────────────────────────────────────
 # ENDPOINTS PACIENTES
 # ─────────────────────────────────────────────
@@ -305,33 +358,37 @@ def obtener_pacientes():
     cursor.close()
     conn.close()
     return rows
- 
+
 @app.post("/pacientes")
 def crear_paciente(data: PacienteModel, request: Request):
     if not verificar_sesion(request):
         raise HTTPException(status_code=401, detail="No autorizado")
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO pacientes (nombre, fecha_estudio, edad, sexo, enfermedad_cardiovascular, imc, epworth) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                   (data.nombre, data.fecha_estudio, data.edad, data.sexo, data.enfermedad_cardiovascular, data.imc, data.epworth))
+    cursor.execute(
+        "INSERT INTO pacientes (nombre, fecha_estudio, edad, sexo, enfermedad_cardiovascular, imc, epworth) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (data.nombre, data.fecha_estudio, data.edad, data.sexo, data.enfermedad_cardiovascular, data.imc, data.epworth)
+    )
     conn.commit()
     cursor.close()
     conn.close()
     return {"status": "success"}
- 
+
 @app.put("/pacientes/{paciente_id}")
 def editar_paciente(paciente_id: int, data: PacienteModel, request: Request):
     if not verificar_sesion(request):
         raise HTTPException(status_code=401, detail="No autorizado")
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE pacientes SET nombre=%s, fecha_estudio=%s, edad=%s, sexo=%s, enfermedad_cardiovascular=%s, imc=%s, epworth=%s WHERE id=%s",
-                   (data.nombre, data.fecha_estudio, data.edad, data.sexo, data.enfermedad_cardiovascular, data.imc, data.epworth, paciente_id))
+    cursor.execute(
+        "UPDATE pacientes SET nombre=%s, fecha_estudio=%s, edad=%s, sexo=%s, enfermedad_cardiovascular=%s, imc=%s, epworth=%s WHERE id=%s",
+        (data.nombre, data.fecha_estudio, data.edad, data.sexo, data.enfermedad_cardiovascular, data.imc, data.epworth, paciente_id)
+    )
     conn.commit()
     cursor.close()
     conn.close()
     return {"status": "success"}
- 
+
 @app.delete("/pacientes/{paciente_id}")
 def eliminar_paciente(paciente_id: int, request: Request):
     if not verificar_sesion(request):
@@ -343,7 +400,7 @@ def eliminar_paciente(paciente_id: int, request: Request):
     cursor.close()
     conn.close()
     return {"status": "success"}
- 
+
 # ─────────────────────────────────────────────
 # ENDPOINTS USUARIOS
 # ─────────────────────────────────────────────
@@ -358,19 +415,24 @@ def obtener_usuarios(request: Request):
     cursor.close()
     conn.close()
     return rows
- 
+
 @app.post("/usuarios")
 def crear_usuario(data: UsuarioModel, request: Request):
+    """Crea un usuario nuevo con contraseña hasheada en bcrypt."""
     if not verificar_sesion(request):
         raise HTTPException(status_code=401, detail="No autorizado")
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO usuarios (usuario, contrasena) VALUES (%s, %s)", (data.usuario, data.contrasena))
+    hashed = hash_password(data.contrasena)
+    cursor.execute(
+        "INSERT INTO usuarios (usuario, contrasena) VALUES (%s, %s)",
+        (data.usuario, hashed)
+    )
     conn.commit()
     cursor.close()
     conn.close()
     return {"status": "success"}
- 
+
 @app.delete("/usuarios/{usuario_id}")
 def eliminar_usuario(usuario_id: int, request: Request):
     if not verificar_sesion(request):
@@ -382,32 +444,17 @@ def eliminar_usuario(usuario_id: int, request: Request):
     cursor.close()
     conn.close()
     return {"status": "success"}
- 
- 
+
 # ─────────────────────────────────────────────
 # ENDPOINT ESP32 — RECEPCIÓN UNIFICADA
-# ─────────────────────────────────────────────
-# Recibe un JSON plano desde el ESP32 y lo distribuye
-# en la estructura relacional de la base de datos:
-#   pacientes → sesiones → horas_sesion → interrupciones → senales_esp32
-#
-# Lógica de resolución automática:
-#   1. Busca el paciente por nombre; si no existe, lo crea.
-#   2. Busca la sesión de HOY para ese paciente; si no existe, la crea.
-#   3. Busca la hora_sesion correspondiente (según la hora del evento);
-#      si no existe, la crea con hora_inicio y hora_fin del bloque de 1 h.
-#   4. Inserta la interrupción (apnea) con todos sus parámetros.
-#   5. Inserta acce_z y flujo como señales individuales en senales_esp32.
-#
-# No requiere autenticación para permitir el acceso directo desde el ESP32.
 # ─────────────────────────────────────────────
 @app.post("/subir-datos")
 async def subir_datos(datos: DatosESP32):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
- 
-        # ── 1. Paciente: buscar por nombre o crear ────────────────────────────
+
+        # ── 1. Paciente ──────────────────────────────────────────────────────
         cursor.execute("SELECT id FROM pacientes WHERE nombre = %s LIMIT 1", (datos.paciente,))
         fila = cursor.fetchone()
         if fila:
@@ -420,8 +467,8 @@ async def subir_datos(datos: DatosESP32):
             )
             conn.commit()
             paciente_id = cursor.lastrowid
- 
-        # ── 2. Sesión: buscar la de hoy o crear ──────────────────────────────
+
+        # ── 2. Sesión de hoy ─────────────────────────────────────────────────
         cursor.execute(
             "SELECT id FROM sesiones WHERE paciente_id = %s AND DATE(fecha) = CURDATE() LIMIT 1",
             (paciente_id,)
@@ -430,20 +477,16 @@ async def subir_datos(datos: DatosESP32):
         if fila:
             sesion_id = fila[0]
         else:
-            cursor.execute(
-                "INSERT INTO sesiones (paciente_id) VALUES (%s)",
-                (paciente_id,)
-            )
+            cursor.execute("INSERT INTO sesiones (paciente_id) VALUES (%s)", (paciente_id,))
             conn.commit()
             sesion_id = cursor.lastrowid
- 
-        # ── 3. Hora de sesión: bloque de 1 h según la hora del evento ─────────
-        # datos.hora tiene formato "HH:MM:SS"
-        partes    = datos.hora.split(":")
-        hora_num  = int(partes[0])              # 0-23
-        hora_ini  = f"{hora_num:02d}:00:00"
-        hora_fin  = f"{(hora_num + 1) % 24:02d}:00:00"
- 
+
+        # ── 3. Hora de sesión (bloque 1 h) ───────────────────────────────────
+        partes   = datos.hora.split(":")
+        hora_num = int(partes[0])
+        hora_ini = f"{hora_num:02d}:00:00"
+        hora_fin = f"{(hora_num + 1) % 24:02d}:00:00"
+
         cursor.execute(
             "SELECT id FROM horas_sesion WHERE sesion_id = %s AND numero_hora = %s LIMIT 1",
             (sesion_id, hora_num)
@@ -458,7 +501,7 @@ async def subir_datos(datos: DatosESP32):
             )
             conn.commit()
             hora_sesion_id = cursor.lastrowid
- 
+
         # ── 4. Interrupción (apnea) ───────────────────────────────────────────
         cursor.execute("""
             INSERT INTO interrupciones
@@ -467,9 +510,9 @@ async def subir_datos(datos: DatosESP32):
         """, (hora_sesion_id, datos.no_apnea, datos.hora, datos.duracion, datos.spo2, datos.ecg))
         conn.commit()
         interrupcion_id = cursor.lastrowid
- 
-        # ── 5. Señales individuales: acce_z y flujo ───────────────────────────
-        timestamp_ms = int(hora_num * 3600000)   # estimado desde la hora del evento
+
+        # ── 5. Señales individuales ───────────────────────────────────────────
+        timestamp_ms = int(hora_num * 3600000)
         cursor.executemany(
             "INSERT INTO senales_esp32 (interrupcion_id, tipo_senal, timestamp_ms, valor) VALUES (%s, %s, %s, %s)",
             [
@@ -480,7 +523,7 @@ async def subir_datos(datos: DatosESP32):
         conn.commit()
         cursor.close()
         conn.close()
- 
+
         return {
             "status": "success",
             "paciente_id":     paciente_id,
@@ -488,10 +531,10 @@ async def subir_datos(datos: DatosESP32):
             "hora_sesion_id":  hora_sesion_id,
             "interrupcion_id": interrupcion_id
         }
- 
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
- 
+
 # ─────────────────────────────────────────────
 # PANEL ADMIN
 # ─────────────────────────────────────────────
@@ -545,9 +588,9 @@ def admin_panel(request: Request):
             <a href="/logout" style="color:#7AAFC5; text-decoration:none; font-size:13px;">Cerrar sesión</a>
         </div>
         <div class="tabs">
-            <div class="tab active" onclick="cambiarTab('pacientes')">👥 Pacientes</div>
-            <div class="tab" onclick="cambiarTab('usuarios')">🔑 Usuarios</div>
-            <div class="tab" onclick="cambiarTab('monitoreo')">📊 Monitoreo ESP32</div>
+            <div class="tab active" onclick="cambiarTab('pacientes', event)">👥 Pacientes</div>
+            <div class="tab" onclick="cambiarTab('usuarios', event)">🔑 Usuarios</div>
+            <div class="tab" onclick="cambiarTab('monitoreo', event)">📊 Monitoreo ESP32</div>
         </div>
         <div class="content">
             <div id="sec-pacientes" class="section active">
@@ -562,7 +605,7 @@ def admin_panel(request: Request):
                     <tbody id="tbody-pacientes"></tbody>
                 </table>
             </div>
- 
+
             <div id="sec-usuarios" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Gestión de usuarios</span>
@@ -573,7 +616,7 @@ def admin_panel(request: Request):
                     <tbody id="tbody-usuarios"></tbody>
                 </table>
             </div>
- 
+
             <div id="sec-monitoreo" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Registros históricos enviados por ESP32 (Solo lectura)</span>
@@ -587,7 +630,7 @@ def admin_panel(request: Request):
                 </table>
             </div>
         </div>
- 
+
         <div class="modal-bg" id="modal-paciente">
             <div class="modal">
                 <h2 id="modal-pac-titulo">Paciente</h2>
@@ -611,43 +654,46 @@ def admin_panel(request: Request):
                 </div>
             </div>
         </div>
- 
+
         <div class="modal-bg" id="modal-usuario">
             <div class="modal">
                 <h2>Nuevo Usuario</h2>
                 <div class="form-group"><label>Usuario</label><input id="usr-nombre"></div>
                 <div class="form-group"><label>Contraseña</label><input id="usr-pass" type="password"></div>
-                <div style="text-align:right;"><button class="btn" onclick="cerrarModals()">Cancelar</button><button class="btn btn-primary" onclick="guardarUsuario()">Guardar</button></div>
+                <div style="text-align:right;">
+                    <button class="btn" onclick="cerrarModals()">Cancelar</button>
+                    <button class="btn btn-primary" onclick="guardarUsuario()">Guardar</button>
+                </div>
             </div>
         </div>
- 
+
         <div class="toast" id="toast"></div>
- 
+
         <script>
             let pacientes = [];
- 
+
             function mostrarToast(msg) {
                 const t = document.getElementById('toast');
                 t.innerText = msg; t.classList.add('show');
                 setTimeout(() => t.classList.remove('show'), 2500);
             }
- 
-            function cambiarTab(tab) {
+
+            function cambiarTab(tab, event) {
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
                 event.currentTarget.classList.add('active');
                 document.getElementById('sec-' + tab).classList.add('active');
-                if(tab === 'pacientes') cargarPacientes();
-                if(tab === 'usuarios') cargarUsuarios();
-                if(tab === 'monitoreo') cargarMonitoreo();
+                if (tab === 'pacientes') cargarPacientes();
+                if (tab === 'usuarios') cargarUsuarios();
+                if (tab === 'monitoreo') cargarMonitoreo();
             }
- 
+
             async function cargarPacientes() {
                 const res = await fetch('/pacientes');
                 pacientes = await res.json();
                 mostrarPacientes(pacientes);
             }
- 
+
             function mostrarPacientes(datos) {
                 const tb = document.getElementById('tbody-pacientes');
                 tb.innerHTML = datos.map(p => `
@@ -665,12 +711,12 @@ def admin_panel(request: Request):
                     </tr>
                 `).join('');
             }
- 
+
             function filtrarPacientes() {
                 const q = document.getElementById('buscar-pac').value.toLowerCase();
                 mostrarPacientes(pacientes.filter(p => p.nombre.toLowerCase().includes(q)));
             }
- 
+
             async function cargarMonitoreo() {
                 const res = await fetch('/datos-sensores');
                 const datos = await res.json();
@@ -687,7 +733,7 @@ def admin_panel(request: Request):
                     </tr>
                 `).join('');
             }
- 
+
             async function cargarUsuarios() {
                 const res = await fetch('/usuarios');
                 const data = await res.json();
@@ -695,11 +741,14 @@ def admin_panel(request: Request):
                     <tr><td>${u.id}</td><td>${u.usuario}</td><td><button class="btn btn-danger" onclick="eliminarUsuario(${u.id})">🗑️</button></td></tr>
                 `).join('');
             }
- 
-            function abrirModalPaciente() { document.getElementById('pac-id').value=''; document.getElementById('modal-paciente').classList.add('show'); }
+
+            function abrirModalPaciente() {
+                document.getElementById('pac-id').value = '';
+                document.getElementById('modal-paciente').classList.add('show');
+            }
             function abrirModalUsuario() { document.getElementById('modal-usuario').classList.add('show'); }
             function cerrarModals() { document.querySelectorAll('.modal-bg').forEach(m => m.classList.remove('show')); }
- 
+
             function editarPaciente(p) {
                 document.getElementById('pac-id').value = p.id;
                 document.getElementById('pac-nombre').value = p.nombre;
@@ -711,7 +760,7 @@ def admin_panel(request: Request):
                 document.getElementById('pac-epworth').value = p.epworth;
                 document.getElementById('modal-paciente').classList.add('show');
             }
- 
+
             async function guardarPaciente() {
                 const id = document.getElementById('pac-id').value;
                 const body = {
@@ -723,25 +772,38 @@ def admin_panel(request: Request):
                     imc: parseFloat(document.getElementById('pac-imc').value) || null,
                     epworth: parseInt(document.getElementById('pac-epworth').value) || null
                 };
-                await fetch(id ? '/pacientes/'+id : '/pacientes', {
+                await fetch(id ? '/pacientes/' + id : '/pacientes', {
                     method: id ? 'PUT' : 'POST',
-                    headers: {'Content-Type': 'application/json'},
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(body)
                 });
-                cerrarModals(); cargarPacientes(); mostrarToast('Hecho');
+                cerrarModals(); cargarPacientes(); mostrarToast('✅ Guardado');
             }
- 
-            async function eliminarPaciente(id) { if(confirm('¿Seguro?')) { await fetch('/pacientes/'+id, {method:'DELETE'}); cargarPacientes(); } }
-            async function eliminarUsuario(id) { if(confirm('¿Seguro?')) { await fetch('/usuarios/'+id, {method:'DELETE'}); cargarUsuarios(); } }
+
+            async function eliminarPaciente(id) {
+                if (confirm('¿Eliminar paciente?')) {
+                    await fetch('/pacientes/' + id, { method: 'DELETE' });
+                    cargarPacientes();
+                }
+            }
+            async function eliminarUsuario(id) {
+                if (confirm('¿Eliminar usuario?')) {
+                    await fetch('/usuarios/' + id, { method: 'DELETE' });
+                    cargarUsuarios();
+                }
+            }
             async function guardarUsuario() {
                 await fetch('/usuarios', {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({usuario: document.getElementById('usr-nombre').value, contrasena: document.getElementById('usr-pass').value})
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        usuario: document.getElementById('usr-nombre').value,
+                        contrasena: document.getElementById('usr-pass').value
+                    })
                 });
-                cerrarModals(); cargarUsuarios();
+                cerrarModals(); cargarUsuarios(); mostrarToast('✅ Usuario creado');
             }
- 
+
             window.onload = cargarPacientes;
         </script>
     </body>
