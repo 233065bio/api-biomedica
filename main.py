@@ -24,16 +24,12 @@ def verificar_sesion(request: Request):
     return request.cookies.get("session") == "ok"
 
 def hash_password(plain: str) -> str:
-    """Genera un hash bcrypt de la contraseña."""
     return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
 
 def check_password(plain: str, hashed: str) -> bool:
-    """Verifica si la contraseña coincide con el hash.
-    También acepta contraseñas en texto plano (migración gradual)."""
     try:
         return bcrypt.checkpw(plain.encode(), hashed.encode())
     except Exception:
-        # Soporte de migración: contraseñas viejas en texto plano
         return plain == hashed
 
 # ─────────────────────────────────────────────
@@ -104,8 +100,6 @@ def startup_event():
                 FOREIGN KEY (interrupcion_id) REFERENCES interrupciones(id)
             )
         """)
-
-        # Insertar usuario admin si no existe (con hash bcrypt)
         cursor.execute("SELECT id FROM usuarios WHERE usuario = 'admin'")
         if not cursor.fetchone():
             hashed = hash_password("admin123")
@@ -164,8 +158,25 @@ class LoginRequest(BaseModel):
     usuario: str
     contrasena: str
 
+class AnotacionModel(BaseModel):
+    anotacion: str
+
 # ─────────────────────────────────────────────
-# LOGIN ADMIN
+# HELPER: convertir timedelta a string HH:MM:SS
+# ─────────────────────────────────────────────
+def timedelta_a_str(valor):
+    if valor is None:
+        return None
+    if hasattr(valor, 'total_seconds'):
+        total = int(valor.total_seconds())
+        h = total // 3600
+        m = (total % 3600) // 60
+        s = total % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return str(valor)
+
+# ─────────────────────────────────────────────
+# LOGIN
 # ─────────────────────────────────────────────
 @app.get("/login", response_class=HTMLResponse)
 def login_page(error: Optional[str] = None):
@@ -217,45 +228,29 @@ def login_page(error: Optional[str] = None):
 
 @app.post("/login")
 async def hacer_login(usuario: str = Form(...), contrasena: str = Form(...)):
-    """
-    Login unificado: verifica primero contra variable de entorno (admin),
-    luego contra la base de datos. Compatible con contraseñas hasheadas y texto plano.
-    """
-    # 1. Verificar contra variables de entorno (admin del sistema)
     if usuario == ADMIN_USER and contrasena == ADMIN_PASS:
         response = RedirectResponse(url="/admin", status_code=302)
         response.set_cookie("session", "ok", httponly=True, samesite="lax")
         return response
-
-    # 2. Verificar contra la base de datos
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
-        cursor.execute(
-            "SELECT id, contrasena FROM usuarios WHERE usuario = %s",
-            (usuario,)
-        )
+        cursor.execute("SELECT id, contrasena FROM usuarios WHERE usuario = %s", (usuario,))
         user = cursor.fetchone()
         cursor.close()
         conn.close()
-
         if user and check_password(contrasena, user["contrasena"]):
             response = RedirectResponse(url="/admin", status_code=302)
             response.set_cookie("session", "ok", httponly=True, samesite="lax")
             return response
     except Exception as e:
         print(f"Error en login BD: {e}")
-
     return RedirectResponse(url="/login?error=1", status_code=302)
-
 
 @app.post("/api/login")
 def api_login_json(data: LoginRequest):
-    """Login JSON para apps móviles / ESP32 / clientes externos."""
-    # Verificar admin de entorno
     if data.usuario == ADMIN_USER and data.contrasena == ADMIN_PASS:
         return {"status": "ok", "usuario": {"id": 0, "usuario": ADMIN_USER}}
-
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
@@ -266,22 +261,154 @@ def api_login_json(data: LoginRequest):
         user = cursor.fetchone()
         cursor.close()
         conn.close()
-
         if user and check_password(data.contrasena, user["contrasena"]):
             return {"status": "ok", "usuario": {"id": user["id"], "usuario": user["usuario"]}}
-
         raise HTTPException(status_code=401, detail="Credenciales incorrectas")
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/logout")
 def logout():
     response = RedirectResponse(url="/login", status_code=302)
     response.delete_cookie("session")
     return response
+
+# ─────────────────────────────────────────────
+# ENDPOINTS SESIONES (para app de escritorio)
+# ─────────────────────────────────────────────
+@app.get("/sesion/por-paciente/{paciente_id}")
+def sesion_por_paciente_id(paciente_id: int):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT id FROM sesiones
+            WHERE paciente_id = %s
+            ORDER BY fecha DESC LIMIT 1
+        """, (paciente_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return {"sesion_id": row["id"] if row else None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sesion/por-nombre/{nombre}")
+def sesion_por_nombre(nombre: str):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT s.id
+            FROM sesiones s
+            JOIN pacientes p ON s.paciente_id = p.id
+            WHERE p.nombre = %s
+            ORDER BY s.fecha DESC LIMIT 1
+        """, (nombre,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return {"sesion_id": row["id"] if row else None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────
+# ENDPOINTS HORAS DE SESIÓN (para app de escritorio)
+# ─────────────────────────────────────────────
+@app.get("/horas-sesion/{sesion_id}")
+def horas_sesion_endpoint(sesion_id: int):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT hs.id, hs.numero_hora, hs.hora_inicio, hs.hora_fin,
+                   COUNT(i.id) AS total_interrupciones
+            FROM horas_sesion hs
+            LEFT JOIN interrupciones i ON i.hora_sesion_id = hs.id
+            WHERE hs.sesion_id = %s
+            GROUP BY hs.id
+            ORDER BY hs.numero_hora
+        """, (sesion_id,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        result = []
+        for r in rows:
+            r = dict(r)
+            r["hora_inicio"] = timedelta_a_str(r.get("hora_inicio"))
+            r["hora_fin"]    = timedelta_a_str(r.get("hora_fin"))
+            result.append(r)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────
+# ENDPOINTS INTERRUPCIONES (para app de escritorio)
+# ─────────────────────────────────────────────
+@app.get("/interrupciones/{hora_sesion_id}")
+def interrupciones_por_hora(hora_sesion_id: int):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT id, numero_interrupcion, hora_detectada,
+                   duracion_segundos, spo2, frecuencia_cardiaca, anotacion
+            FROM interrupciones
+            WHERE hora_sesion_id = %s
+            ORDER BY numero_interrupcion
+        """, (hora_sesion_id,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        result = []
+        for r in rows:
+            r = dict(r)
+            r["hora_detectada"] = timedelta_a_str(r.get("hora_detectada"))
+            result.append(r)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/interrupciones/{interrupcion_id}/anotacion")
+async def guardar_anotacion_endpoint(interrupcion_id: int, body: AnotacionModel):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE interrupciones SET anotacion=%s WHERE id=%s",
+            (body.anotacion, interrupcion_id)
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────
+# ENDPOINTS SEÑALES (para app de escritorio)
+# ─────────────────────────────────────────────
+@app.get("/senales/{interrupcion_id}/{tipo}")
+def senales_por_interrupcion(interrupcion_id: int, tipo: str):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT timestamp_ms, valor
+            FROM senales_esp32
+            WHERE interrupcion_id = %s AND tipo_senal = %s
+            ORDER BY timestamp_ms
+        """, (interrupcion_id, tipo))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
 # ENDPOINTS ESP32
@@ -310,7 +437,13 @@ def obtener_datos_sensores(request: Request):
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
-        return rows
+        # Serializar timedelta
+        result = []
+        for r in rows:
+            r = dict(r)
+            r["hora_detectada"] = timedelta_a_str(r.get("hora_detectada"))
+            result.append(r)
+        return result
     except Exception as e:
         return {"error": str(e)}
 
@@ -357,7 +490,14 @@ def obtener_pacientes():
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
-    return rows
+    # Serializar fechas
+    result = []
+    for r in rows:
+        r = dict(r)
+        if r.get("fecha_estudio"):
+            r["fecha_estudio"] = str(r["fecha_estudio"])
+        result.append(r)
+    return result
 
 @app.post("/pacientes")
 def crear_paciente(data: PacienteModel, request: Request):
@@ -418,7 +558,6 @@ def obtener_usuarios(request: Request):
 
 @app.post("/usuarios")
 def crear_usuario(data: UsuarioModel, request: Request):
-    """Crea un usuario nuevo con contraseña hasheada en bcrypt."""
     if not verificar_sesion(request):
         raise HTTPException(status_code=401, detail="No autorizado")
     conn = get_db_connection()
@@ -454,7 +593,6 @@ async def subir_datos(datos: DatosESP32):
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # ── 1. Paciente ──────────────────────────────────────────────────────
         cursor.execute("SELECT id FROM pacientes WHERE nombre = %s LIMIT 1", (datos.paciente,))
         fila = cursor.fetchone()
         if fila:
@@ -468,7 +606,6 @@ async def subir_datos(datos: DatosESP32):
             conn.commit()
             paciente_id = cursor.lastrowid
 
-        # ── 2. Sesión de hoy ─────────────────────────────────────────────────
         cursor.execute(
             "SELECT id FROM sesiones WHERE paciente_id = %s AND DATE(fecha) = CURDATE() LIMIT 1",
             (paciente_id,)
@@ -481,7 +618,6 @@ async def subir_datos(datos: DatosESP32):
             conn.commit()
             sesion_id = cursor.lastrowid
 
-        # ── 3. Hora de sesión (bloque 1 h) ───────────────────────────────────
         partes   = datos.hora.split(":")
         hora_num = int(partes[0])
         hora_ini = f"{hora_num:02d}:00:00"
@@ -502,7 +638,6 @@ async def subir_datos(datos: DatosESP32):
             conn.commit()
             hora_sesion_id = cursor.lastrowid
 
-        # ── 4. Interrupción (apnea) ───────────────────────────────────────────
         cursor.execute("""
             INSERT INTO interrupciones
                 (hora_sesion_id, numero_interrupcion, hora_detectada, duracion_segundos, spo2, frecuencia_cardiaca)
@@ -511,7 +646,6 @@ async def subir_datos(datos: DatosESP32):
         conn.commit()
         interrupcion_id = cursor.lastrowid
 
-        # ── 5. Señales individuales ───────────────────────────────────────────
         timestamp_ms = int(hora_num * 3600000)
         cursor.executemany(
             "INSERT INTO senales_esp32 (interrupcion_id, tipo_senal, timestamp_ms, valor) VALUES (%s, %s, %s, %s)",
@@ -723,7 +857,7 @@ def admin_panel(request: Request):
                 document.getElementById('tbody-monitoreo').innerHTML = datos.map(d => `
                     <tr>
                         <td><strong>${d.paciente_nombre}</strong></td>
-                        <td>${d.hora_detectada}</td>
+                        <td>${d.hora_detectada || '--'}</td>
                         <td><span class="badge ${d.spo2 < 90 ? 'badge-crit' : 'badge-ok'}">${d.spo2}%</span></td>
                         <td>${d.ecg}</td>
                         <td>${d.acce_z || 0}</td>
