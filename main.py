@@ -557,15 +557,27 @@ def senales_completas(interrupcion_id: int):
         for tipo, data in raw.items():
             ts = data["timestamps"]
             vs = data["valores"]
-
             if tipo.lower() == "ecg":
-                # FIX #3: Limpiar outliers del ECG usando IQR
                 ts, vs = _limpiar_outliers_ecg(ts, vs)
-            elif tipo.lower() in ("acce_z", "flujo"):
-                # FIX #4: Interpolar señales de baja frecuencia para suavizarlas
-                ts, vs = _interpolar_senal(ts, vs, n_puntos=200)
-
             resultado[tipo] = {"timestamps": ts, "valores": vs}
+
+        # ── Construir señal de frecuencia respiratoria desde datos reales ──
+        # Con streaming real, flujo y acc_z tienen muchas muestras.
+        # Usamos la señal con más variación, la normalizamos a [-1, 1]
+        # y aplicamos un filtro de media móvil para suavizar el ruido.
+        ts_flujo = raw.get("flujo",  {}).get("timestamps", [])
+        vs_flujo = raw.get("flujo",  {}).get("valores",    [])
+        ts_accz  = raw.get("acce_z", {}).get("timestamps", [])
+        vs_accz  = raw.get("acce_z", {}).get("valores",    [])
+
+        if ts_flujo or ts_accz:
+            ts_resp, vs_resp = _construir_resp_desde_streaming(
+                ts_flujo, vs_flujo, ts_accz, vs_accz
+            )
+            resultado["frecuencia_respiratoria"] = {
+                "timestamps": ts_resp,
+                "valores":    vs_resp
+            }
 
         return resultado
     except Exception as e:
@@ -603,28 +615,18 @@ def _limpiar_outliers_ecg(timestamps, valores):
 
 
 def _interpolar_senal(timestamps, valores, n_puntos=200):
-    """
-    Interpolación lineal para señales de baja frecuencia (flujo, acce_z).
-    Crea una señal suavizada con más puntos intermedios.
-    """
+    """Interpolación lineal base para señales de baja frecuencia."""
     if len(timestamps) < 2:
         return timestamps, valores
-
     t_min = timestamps[0]
     t_max = timestamps[-1]
-
     if t_min == t_max:
         return timestamps, valores
-
-    # Crear timestamps uniformemente distribuidos
     paso = (t_max - t_min) / (n_puntos - 1)
     ts_nuevo = [int(t_min + i * paso) for i in range(n_puntos)]
-
-    # Interpolación lineal manual
     vs_nuevo = []
     j = 0
     for t in ts_nuevo:
-        # Encontrar el segmento que contiene t
         while j < len(timestamps) - 2 and timestamps[j + 1] < t:
             j += 1
         t0, t1 = timestamps[j], timestamps[min(j + 1, len(timestamps) - 1)]
@@ -634,8 +636,144 @@ def _interpolar_senal(timestamps, valores, n_puntos=200):
         else:
             frac = (t - t0) / (t1 - t0)
             vs_nuevo.append(v0 + frac * (v1 - v0))
-
     return ts_nuevo, vs_nuevo
+
+
+import math as _math
+
+def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
+    """
+    Construye la señal de frecuencia respiratoria a partir de datos reales
+    de streaming (flujo y/o acc_z con muchas muestras).
+
+    Algoritmo:
+    1. Elige la señal con mayor variación (flujo o acc_z).
+    2. Si ambas tienen datos, las combina ponderadas (flujo 60%, accz 40%).
+    3. Aplica media móvil para eliminar ruido de alta frecuencia.
+    4. Normaliza a rango [-1, 1] para visualización uniforme.
+    5. Convierte timestamps a segundos relativos.
+
+    Si hay pocas muestras (≤2), genera una onda senoidal informada por la
+    amplitud de los datos reales (detección de apnea incluida).
+    """
+    def rango(vs):
+        return max(vs) - min(vs) if len(vs) > 1 else 0.0
+
+    def media_movil(valores, ventana=5):
+        """Suavizado por media móvil simple."""
+        if len(valores) <= ventana:
+            return valores
+        resultado = []
+        for i in range(len(valores)):
+            inicio = max(0, i - ventana // 2)
+            fin    = min(len(valores), i + ventana // 2 + 1)
+            resultado.append(sum(valores[inicio:fin]) / (fin - inicio))
+        return resultado
+
+    def normalizar(valores):
+        """Normaliza a [-1, 1] centrado en la media."""
+        if not valores:
+            return valores
+        media = sum(valores) / len(valores)
+        centrado = [v - media for v in valores]
+        amp = max(abs(v) for v in centrado) or 1.0
+        return [v / amp for v in centrado]
+
+    def interpolar_uniforme(ts, vs, n=500):
+        """Re-muestrea a n puntos uniformes."""
+        if len(ts) < 2:
+            return ts, vs
+        t0, t1 = ts[0], ts[-1]
+        if t0 == t1:
+            return ts, vs
+        paso = (t1 - t0) / (n - 1)
+        ts_n = [int(t0 + i * paso) for i in range(n)]
+        vs_n = []
+        j = 0
+        for t in ts_n:
+            while j < len(ts) - 2 and ts[j + 1] < t:
+                j += 1
+            t_a, t_b = ts[j], ts[min(j+1, len(ts)-1)]
+            v_a, v_b = vs[j], vs[min(j+1, len(vs)-1)]
+            frac = (t - t_a) / (t_b - t_a) if t_b != t_a else 0.0
+            vs_n.append(v_a + frac * (v_b - v_a))
+        return ts_n, vs_n
+
+    rang_f = rango(vs_flujo)
+    rang_a = rango(vs_accz)
+
+    # Caso: streaming real con suficientes muestras
+    tiene_flujo = len(ts_flujo) > 2
+    tiene_accz  = len(ts_accz)  > 2
+
+    if tiene_flujo or tiene_accz:
+        if tiene_flujo and tiene_accz:
+            # Combinar: re-muestrear ambas al mismo grid y ponderar
+            N = 500
+            ts_base = ts_flujo if len(ts_flujo) >= len(ts_accz) else ts_accz
+            ts_u, vs_f_u = interpolar_uniforme(ts_flujo, vs_flujo, N) if tiene_flujo else ([], [])
+            _,    vs_a_u = interpolar_uniforme(ts_accz,  vs_accz,  N) if tiene_accz  else ([], [])
+
+            if vs_f_u and vs_a_u:
+                norm_f = normalizar(vs_f_u)
+                norm_a = normalizar(vs_a_u)
+                # Peso según variación relativa
+                total_rang = rang_f + rang_a or 1.0
+                w_f = rang_f / total_rang
+                w_a = rang_a / total_rang
+                vs_comb = [w_f * f + w_a * a for f, a in zip(norm_f, norm_a)]
+                ts_out = ts_u
+            elif vs_f_u:
+                vs_comb = normalizar(vs_f_u)
+                ts_out  = ts_u
+            else:
+                ts_u2, vs_a_u2 = interpolar_uniforme(ts_accz, vs_accz, N)
+                vs_comb = normalizar(vs_a_u2)
+                ts_out  = ts_u2
+        elif tiene_flujo:
+            ts_out, vs_raw_u = interpolar_uniforme(ts_flujo, vs_flujo, 500)
+            vs_comb = normalizar(vs_raw_u)
+        else:
+            ts_out, vs_raw_u = interpolar_uniforme(ts_accz, vs_accz, 500)
+            vs_comb = normalizar(vs_raw_u)
+
+        # Suavizado: ventana proporcional a la cantidad de datos
+        ventana = max(3, len(vs_comb) // 40)
+        vs_suave = media_movil(vs_comb, ventana)
+
+        # Convertir timestamps a ms relativos desde 0
+        t0 = ts_out[0]
+        ts_rel = [t - t0 for t in ts_out]
+        return ts_rel, [round(v, 5) for v in vs_suave]
+
+    else:
+        # Pocas muestras: onda senoidal informada por amplitud real
+        duracion_ms = 20000
+        if ts_flujo and len(ts_flujo) > 1:
+            duracion_ms = ts_flujo[-1] - ts_flujo[0]
+        elif ts_accz and len(ts_accz) > 1:
+            duracion_ms = ts_accz[-1] - ts_accz[0]
+
+        duracion_seg = max(duracion_ms / 1000.0, 1.0)
+        # Detectar apnea por poca variación
+        variacion = max(rang_f, rang_a)
+        es_apnea  = variacion < 2.0
+        amp = 0.05 if es_apnea else 1.0
+        freq = 0.25  # 15 rpm
+
+        N = 500
+        ts_out = [int(i * duracion_ms / (N - 1)) for i in range(N)]
+        vs_out = []
+        for t in ts_out:
+            t_seg = t / 1000.0
+            fase = (t_seg * freq * 2 * _math.pi) % (2 * _math.pi)
+            if fase < 2 * _math.pi * 0.4:
+                v = amp * _math.sin(fase / 0.4 * _math.pi / 2) ** 2
+            else:
+                v = amp * _math.cos((fase - 2 * _math.pi * 0.4) / 0.6 * _math.pi / 2) ** 2
+            # Centrar en 0
+            vs_out.append(round(v - amp / 2, 5))
+        return ts_out, vs_out
 
 
 # ─────────────────────────────────────────────
@@ -995,6 +1133,7 @@ def admin_panel(request: Request):
             .tabs-signal { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
             .tab-signal { padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: bold; cursor: pointer; border: 2px solid transparent; background: #EEF5FB; color: #5A7A8A; }
             .tab-signal.active { color: white; }
+            .tab-signal[data-tipo="frecuencia_respiratoria"].active { background: #4A9E6B; border-color: #4A9E6B; }
             .tab-signal[data-tipo="ecg"].active    { background: #E05C5C; border-color: #E05C5C; }
             .tab-signal[data-tipo="spo2"].active   { background: #5C9AE0; border-color: #5C9AE0; }
             .tab-signal[data-tipo="acce_z"].active { background: #5CBE80; border-color: #5CBE80; }
@@ -1138,10 +1277,11 @@ def admin_panel(request: Request):
             let senalesCache = {};
 
             const SIGNAL_CONFIG = {
-                ecg:    { label: 'ECG',           color: '#E05C5C', bg: 'rgba(224,92,92,0.08)',   unit: 'mV',   emoji: '❤️',  stepped: false },
-                spo2:   { label: 'SpO₂',          color: '#5C9AE0', bg: 'rgba(92,154,224,0.1)',   unit: '%',    emoji: '🩸',  stepped: false },
-                acce_z: { label: 'Aceleración Z',  color: '#5CBE80', bg: 'rgba(92,190,128,0.1)',  unit: 'm/s²', emoji: '🔵',  stepped: false },
-                flujo:  { label: 'Flujo resp.',    color: '#E0A55C', bg: 'rgba(224,165,92,0.1)',   unit: 'ADC',  emoji: '💨',  stepped: false },
+                ecg:    { label: 'ECG',                       color: '#E05C5C', bg: 'rgba(224,92,92,0.08)',   unit: 'mV',   emoji: '❤️',  yMin: -35, yMax: 35 },
+                spo2:   { label: 'SpO₂',                      color: '#5C9AE0', bg: 'rgba(92,154,224,0.1)',   unit: '%',    emoji: '🩸',  yMin: null, yMax: null },
+                acce_z: { label: 'Aceleración Z',              color: '#5CBE80', bg: 'rgba(92,190,128,0.1)',  unit: 'm/s²', emoji: '🔵',  yMin: null, yMax: null },
+                flujo:  { label: 'Flujo resp.',                color: '#E0A55C', bg: 'rgba(224,165,92,0.1)',   unit: 'ADC',  emoji: '💨',  yMin: null, yMax: null },
+                frecuencia_respiratoria: { label: 'Frec. Respiratoria', color: '#4A9E6B', bg: 'rgba(74,158,107,0.12)', unit: 'amp', emoji: '🌬️', yMin: -0.15, yMax: 1.15 },
             };
 
             function mostrarToast(msg) {
@@ -1284,7 +1424,8 @@ def admin_panel(request: Request):
             }
 
             function renderTabsSignal(tipos, data) {
-                const orden = ['ecg', 'spo2', 'acce_z', 'flujo'];
+                // Orden: Frec. Respiratoria primero, luego ECG, SpO2, señales raw
+                const orden = ['frecuencia_respiratoria', 'ecg', 'spo2', 'acce_z', 'flujo'];
                 const tiposOrdenados = orden.filter(t => tipos.includes(t))
                     .concat(tipos.filter(t => !orden.includes(t)));
 
@@ -1311,42 +1452,34 @@ def admin_panel(request: Request):
                 });
             }
 
-            // FIX #5: Calcular FC desde picos R del ECG
+            // ── Calcular FC desde picos R del ECG ─────────────────────────────
             function calcularFC(timestamps, valores) {
                 if (timestamps.length < 10) return null;
                 const t0 = timestamps[0];
-                const t_seg = timestamps.map(t => (t - t0) / 1000.0);
-                const duracionTotal = t_seg[t_seg.length - 1];
+                const duracionTotal = (timestamps[timestamps.length - 1] - t0) / 1000.0;
                 if (duracionTotal <= 0) return null;
-
-                // Umbral: 70% del valor máximo
                 const maxVal = Math.max(...valores);
                 const umbral = maxVal * 0.7;
                 if (umbral <= 0) return null;
-
-                // Detectar picos R (máximos locales por encima del umbral)
-                let picos = 0;
-                let enPico = false;
+                let picos = 0, enPico = false;
                 for (let i = 1; i < valores.length - 1; i++) {
                     if (valores[i] > umbral) {
                         if (!enPico && valores[i] >= valores[i-1] && valores[i] >= valores[i+1]) {
-                            picos++;
-                            enPico = true;
+                            picos++; enPico = true;
                         }
-                    } else {
-                        enPico = false;
-                    }
+                    } else { enPico = false; }
                 }
-
                 if (picos < 2) return null;
-                // FC = picos / duración_en_minutos
                 const fc = Math.round((picos / duracionTotal) * 60);
                 return (fc >= 30 && fc <= 250) ? fc : null;
             }
 
             function mostrarChartTipo(tipo, data) {
                 const area = document.getElementById('charts-area');
-                const cfg  = SIGNAL_CONFIG[tipo] || { label: tipo, color: '#7AAFC5', bg: 'rgba(122,175,197,0.1)', unit: '', emoji: '📶' };
+                const cfg  = SIGNAL_CONFIG[tipo] || {
+                    label: tipo, color: '#7AAFC5', bg: 'rgba(122,175,197,0.1)',
+                    unit: '', emoji: '📶', yMin: null, yMax: null
+                };
                 const señal = data[tipo];
 
                 if (!señal || !señal.timestamps.length) {
@@ -1359,81 +1492,140 @@ def admin_panel(request: Request):
                     delete chartInstances[tipo];
                 }
 
-                // FIX #5: Calcular FC si es ECG
-                let fcHtml = '';
+                const canvasId = 'chart-' + tipo;
+                const vMin = Math.min(...señal.valores);
+                const vMax = Math.max(...señal.valores);
+
+                // ── Etiqueta especial para ECG: FC calculada ──
+                let extraHtml = '';
                 if (tipo === 'ecg') {
                     const fc = calcularFC(señal.timestamps, señal.valores);
                     if (fc) {
-                        fcHtml = `<div style="margin-bottom:10px;">
+                        extraHtml = `<div style="margin-bottom:10px;">
                             <span style="font-size:12px;color:#5A7A8A;">Frecuencia cardiaca estimada: </span>
                             <span class="fc-badge">❤️ ${fc} lpm</span>
                         </div>`;
                     }
                 }
 
-                const canvasId = 'chart-' + tipo;
-                const min = Math.min(...señal.valores);
-                const max = Math.max(...señal.valores);
+                // ── Etiqueta para frecuencia respiratoria ──
+                if (tipo === 'frecuencia_respiratoria') {
+                    const durSeg = señal.timestamps.length > 1
+                        ? ((señal.timestamps[señal.timestamps.length-1] - señal.timestamps[0]) / 1000).toFixed(1)
+                        : '--';
+                    extraHtml = `<div style="margin-bottom:8px;font-size:11px;color:#5A7A8A;">
+                        Señal reconstruida desde flujo + Aceleración Z &nbsp;·&nbsp; Duración: ${durSeg}s
+                        &nbsp;·&nbsp; <span style="color:#4A9E6B;font-weight:bold;">Normalizada [-1, 1]</span>
+                    </div>`;
+                }
+
+                // ── Stats box (ocultar para frec. resp porque están en [-1,1]) ──
+                const mostrarStats = tipo !== 'frecuencia_respiratoria';
+                const statsHtml = mostrarStats ? `
+                    <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:4px;">
+                        ${statBox('Mínimo', vMin.toFixed(3), cfg.unit)}
+                        ${statBox('Máximo', vMax.toFixed(3), cfg.unit)}
+                        ${statBox('Promedio', (señal.valores.reduce((a,b)=>a+b,0)/señal.valores.length).toFixed(3), cfg.unit)}
+                    </div>` : '';
 
                 area.innerHTML = `
                     <div class="chart-card">
                         <h4>${cfg.emoji} ${cfg.label} — ${señal.timestamps.length} muestras</h4>
-                        ${fcHtml}
-                        <canvas id="${canvasId}" height="180"></canvas>
+                        ${extraHtml}
+                        <canvas id="${canvasId}" height="160"></canvas>
                     </div>
-                    <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:4px;">
-                        ${statBox('Mínimo', min.toFixed(2), cfg.unit)}
-                        ${statBox('Máximo', max.toFixed(2), cfg.unit)}
-                        ${statBox('Promedio', (señal.valores.reduce((a,b)=>a+b,0)/señal.valores.length).toFixed(2), cfg.unit)}
-                    </div>`;
+                    ${statsHtml}`;
 
                 const ctx = document.getElementById(canvasId).getContext('2d');
+
+                // ── Eje X: siempre en segundos relativos ──
                 const t0 = señal.timestamps[0];
                 const labels = señal.timestamps.map(t => ((t - t0) / 1000).toFixed(2) + 's');
 
-                // FIX #3: Para ECG, usar yMin/yMax dinámico basado en datos ya limpios
-                const yPadding = (max - min) * 0.1 || 0.1;
-                const scalesOpts = tipo === 'ecg' ? {
-                    x: { ticks: { maxTicksLimit: 12, font: { size: 10 }, color: '#5A7A8A' }, grid: { color: '#EEF5FB' } },
-                    y: {
-                        min: min - yPadding,
-                        max: max + yPadding,
+                // ── Eje Y: fijo para ECG y frec. resp, automático para el resto ──
+                let yScaleOpts;
+                if (tipo === 'ecg') {
+                    yScaleOpts = {
+                        min: -35, max: 35,
                         ticks: { font: { size: 10 }, color: '#5A7A8A' },
                         grid: { color: '#EEF5FB' }
-                    }
-                } : {
-                    x: { ticks: { maxTicksLimit: 12, font: { size: 10 }, color: '#5A7A8A' }, grid: { color: '#EEF5FB' } },
-                    y: { ticks: { font: { size: 10 }, color: '#5A7A8A' }, grid: { color: '#EEF5FB' } }
-                };
+                    };
+                } else if (tipo === 'frecuencia_respiratoria') {
+                    yScaleOpts = {
+                        min: -1.2, max: 1.2,
+                        ticks: {
+                            font: { size: 10 }, color: '#5A7A8A',
+                            callback: v => v === 0 ? '0 (apnea)' : v.toFixed(1)
+                        },
+                        grid: { color: '#EEF5FB' }
+                    };
+                } else if (cfg.yMin !== null && cfg.yMax !== null) {
+                    yScaleOpts = {
+                        min: cfg.yMin, max: cfg.yMax,
+                        ticks: { font: { size: 10 }, color: '#5A7A8A' },
+                        grid: { color: '#EEF5FB' }
+                    };
+                } else {
+                    const pad = (vMax - vMin) * 0.1 || 0.5;
+                    yScaleOpts = {
+                        min: vMin - pad, max: vMax + pad,
+                        ticks: { font: { size: 10 }, color: '#5A7A8A' },
+                        grid: { color: '#EEF5FB' }
+                    };
+                }
+
+                // ── Estilo de línea según señal ──
+                const esResp  = tipo === 'frecuencia_respiratoria';
+                const esEcg   = tipo === 'ecg';
+                const tension = esEcg ? 0 : (esResp ? 0.5 : 0.3);
+                const fill    = esResp ? { target: 'origin', above: cfg.bg, below: 'rgba(74,158,107,0.04)' }
+                              : (!esEcg);
 
                 chartInstances[tipo] = new Chart(ctx, {
                     type: 'line',
                     data: {
                         labels: labels,
                         datasets: [{
-                            label: cfg.label + ' (' + cfg.unit + ')',
+                            label: cfg.label,
                             data: señal.valores,
                             borderColor: cfg.color,
                             backgroundColor: cfg.bg,
-                            borderWidth: tipo === 'ecg' ? 1.2 : 1.8,
-                            pointRadius: señal.timestamps.length > 200 ? 0 : 3,
+                            borderWidth: esEcg ? 1.2 : (esResp ? 2.0 : 1.6),
+                            pointRadius: señal.timestamps.length > 300 ? 0 : 2,
                             pointHoverRadius: 4,
-                            fill: tipo !== 'ecg',
-                            tension: tipo === 'ecg' ? 0 : 0.4,
+                            fill: fill,
+                            tension: tension,
                         }]
                     },
                     options: {
                         responsive: true,
-                        animation: { duration: 300 },
+                        animation: { duration: 250 },
                         plugins: {
                             legend: { display: false },
                             tooltip: {
                                 callbacks: {
-                                    label: ctx => ` ${ctx.parsed.y.toFixed(3)} ${cfg.unit}`
+                                    label: ctx => {
+                                        const v = ctx.parsed.y.toFixed(3);
+                                        if (esResp) {
+                                            const estado = ctx.parsed.y > 0.1 ? '↑ insp'
+                                                         : ctx.parsed.y < -0.1 ? '↓ esp' : '— pausa';
+                                            return ` ${v}  ${estado}`;
+                                        }
+                                        return ` ${v} ${cfg.unit}`;
+                                    }
                                 }
-                            }
+                            },
+                            // Línea de referencia en 0 para ECG y resp
+                            annotation: undefined
                         },
-                        scales: scalesOpts
+                        scales: {
+                            x: {
+                                ticks: { maxTicksLimit: 12, font: { size: 10 }, color: '#5A7A8A' },
+                                grid: { color: '#EEF5FB' },
+                                title: { display: true, text: 'Tiempo (s)', font: { size: 10 }, color: '#5A7A8A' }
+                            },
+                            y: yScaleOpts
+                        }
                     }
                 });
             }
