@@ -615,6 +615,21 @@ def editar_paciente(paciente_id: int, data: PacienteModel, request: Request):
     conn.close()
     return {"status": "success"}
 
+@app.delete("/interrupciones/{interrupcion_id}")
+def eliminar_interrupcion(interrupcion_id: int):
+    """Elimina una interrupción y sus señales asociadas. Usado por el script de importación."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM senales_esp32 WHERE interrupcion_id=%s", (interrupcion_id,))
+        cursor.execute("DELETE FROM interrupciones WHERE id=%s", (interrupcion_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.delete("/pacientes/{paciente_id}")
 def eliminar_paciente(paciente_id: int, request: Request):
     if not verificar_sesion(request):
