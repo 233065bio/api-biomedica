@@ -340,7 +340,8 @@ def sesiones_por_paciente(paciente_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
-# ENDPOINTS HORAS DE SESIÓN (para app de escritorio)
+# ENDPOINTS HORAS DE SESIÓN
+# FIX #2: Añadir hora_orden (1,2,3...) y hora_real para distinguirlos
 # ─────────────────────────────────────────────
 @app.get("/horas-sesion/{sesion_id}")
 def horas_sesion_endpoint(sesion_id: int):
@@ -361,38 +362,67 @@ def horas_sesion_endpoint(sesion_id: int):
         conn.close()
 
         result = []
-        for r in rows:
+        for idx, r in enumerate(rows):
             r = dict(r)
             r["hora_inicio"] = timedelta_a_str(r.get("hora_inicio"))
             r["hora_fin"]    = timedelta_a_str(r.get("hora_fin"))
+            # FIX #2: hora_orden es el número consecutivo (1, 2, 3...)
+            # hora_real es el numero_hora original (ej: 20, 21, 22...)
+            r["hora_orden"]  = idx + 1
+            r["hora_real"]   = r["numero_hora"]
             result.append(r)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
-# ENDPOINTS INTERRUPCIONES (para app de escritorio)
+# ENDPOINTS INTERRUPCIONES
+# FIX #1: Renumerar consecutivamente dentro de la sesión
 # ─────────────────────────────────────────────
 @app.get("/interrupciones/{hora_sesion_id}")
 def interrupciones_por_hora(hora_sesion_id: int):
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
+
+        # Obtener la sesion_id de esta hora para renumerar en contexto de sesión
+        cursor.execute("""
+            SELECT sesion_id FROM horas_sesion WHERE id = %s
+        """, (hora_sesion_id,))
+        sesion_row = cursor.fetchone()
+
         cursor.execute("""
             SELECT id, numero_interrupcion, hora_detectada,
                    duracion_segundos, spo2, frecuencia_cardiaca, anotacion
             FROM interrupciones
             WHERE hora_sesion_id = %s
-            ORDER BY numero_interrupcion
+            ORDER BY id
         """, (hora_sesion_id,))
         rows = cursor.fetchall()
+
+        # FIX #1: Calcular el offset para numeración consecutiva global por sesión
+        offset = 0
+        if sesion_row:
+            sesion_id = sesion_row["sesion_id"]
+            cursor.execute("""
+                SELECT COUNT(i.id) as cnt
+                FROM interrupciones i
+                JOIN horas_sesion hs ON i.hora_sesion_id = hs.id
+                WHERE hs.sesion_id = %s AND hs.id < %s
+            """, (sesion_id, hora_sesion_id))
+            offset_row = cursor.fetchone()
+            if offset_row:
+                offset = offset_row["cnt"]
+
         cursor.close()
         conn.close()
 
         result = []
-        for r in rows:
+        for local_idx, r in enumerate(rows):
             r = dict(r)
             r["hora_detectada"] = timedelta_a_str(r.get("hora_detectada"))
+            # FIX #1: numero_consecutivo = offset de apneas anteriores + posición local
+            r["numero_consecutivo"] = offset + local_idx + 1
             result.append(r)
         return result
     except Exception as e:
@@ -400,6 +430,7 @@ def interrupciones_por_hora(hora_sesion_id: int):
 
 # ─────────────────────────────────────────────
 # ENDPOINT: INTERRUPCIONES POR SESIÓN (para visor)
+# FIX #1: Añadir numero_consecutivo global
 # ─────────────────────────────────────────────
 @app.get("/interrupciones-sesion/{sesion_id}")
 def interrupciones_por_sesion(sesion_id: int):
@@ -417,12 +448,39 @@ def interrupciones_por_sesion(sesion_id: int):
             ORDER BY i.id
         """, (sesion_id,))
         rows = cursor.fetchall()
+
+        # FIX #2: Obtener hora_orden (consecutivo) para cada hora real
+        cursor.execute("""
+            SELECT id, numero_hora,
+                   ROW_NUMBER() OVER (ORDER BY numero_hora) AS hora_orden
+            FROM horas_sesion
+            WHERE sesion_id = %s
+        """, (sesion_id,))
+        horas_rows = cursor.fetchall()
+        hora_orden_map = {h["id"] if "id" in h else h[0]: h["hora_orden"] if "hora_orden" in h else h[2]
+                          for h in horas_rows}
+
+        # Reconstruir mapa con ids correctos
+        cursor.execute("""
+            SELECT hs.id as hs_id, hs.numero_hora,
+                   ROW_NUMBER() OVER (ORDER BY hs.numero_hora) AS hora_orden
+            FROM horas_sesion hs
+            WHERE hs.sesion_id = %s
+        """, (sesion_id,))
+        horas_info = cursor.fetchall()
+        hora_orden_map = {}
+        for h in horas_info:
+            hora_orden_map[h["hs_id"]] = h["hora_orden"]
+
         cursor.close()
         conn.close()
+
         result = []
-        for r in rows:
+        for global_idx, r in enumerate(rows):
             r = dict(r)
             r["hora_detectada"] = timedelta_a_str(r.get("hora_detectada"))
+            # FIX #1: Número consecutivo global
+            r["numero_consecutivo"] = global_idx + 1
             result.append(r)
         return result
     except Exception as e:
@@ -445,7 +503,7 @@ async def guardar_anotacion_endpoint(interrupcion_id: int, body: AnotacionModel)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
-# ENDPOINTS SEÑALES (para app de escritorio y visor)
+# ENDPOINTS SEÑALES
 # ─────────────────────────────────────────────
 @app.get("/senales/{interrupcion_id}/{tipo}")
 def senales_por_interrupcion(interrupcion_id: int, tipo: str):
@@ -466,11 +524,13 @@ def senales_por_interrupcion(interrupcion_id: int, tipo: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
-# ENDPOINT: TODAS LAS SEÑALES DE UNA INTERRUPCIÓN
+# ENDPOINT: TODAS LAS SEÑALES
+# FIX #3: Filtrar outliers estadísticos del ECG (IQR)
+# FIX #4: Interpolar señales de baja frecuencia (flujo, acce_z)
 # ─────────────────────────────────────────────
 @app.get("/senales-completas/{interrupcion_id}")
 def senales_completas(interrupcion_id: int):
-    """Devuelve todas las señales de una interrupción agrupadas por tipo."""
+    """Devuelve todas las señales agrupadas por tipo, con limpieza de outliers."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
@@ -485,17 +545,98 @@ def senales_completas(interrupcion_id: int):
         conn.close()
 
         # Agrupar por tipo de señal
-        resultado = {}
+        raw = {}
         for r in rows:
             tipo = r["tipo_senal"]
-            if tipo not in resultado:
-                resultado[tipo] = {"timestamps": [], "valores": []}
-            resultado[tipo]["timestamps"].append(r["timestamp_ms"])
-            resultado[tipo]["valores"].append(float(r["valor"]))
+            if tipo not in raw:
+                raw[tipo] = {"timestamps": [], "valores": []}
+            raw[tipo]["timestamps"].append(r["timestamp_ms"])
+            raw[tipo]["valores"].append(float(r["valor"]))
+
+        resultado = {}
+        for tipo, data in raw.items():
+            ts = data["timestamps"]
+            vs = data["valores"]
+
+            if tipo.lower() == "ecg":
+                # FIX #3: Limpiar outliers del ECG usando IQR
+                ts, vs = _limpiar_outliers_ecg(ts, vs)
+            elif tipo.lower() in ("acce_z", "flujo"):
+                # FIX #4: Interpolar señales de baja frecuencia para suavizarlas
+                ts, vs = _interpolar_senal(ts, vs, n_puntos=200)
+
+            resultado[tipo] = {"timestamps": ts, "valores": vs}
 
         return resultado
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _limpiar_outliers_ecg(timestamps, valores):
+    """
+    Elimina outliers del ECG usando el método IQR.
+    Valores que excedan mediana ± 5*IQR se recortan (clip) al límite,
+    preservando la forma de la onda pero evitando que un pico enorme
+    comprima el resto de la escala.
+    """
+    if len(valores) < 10:
+        return timestamps, valores
+
+    import statistics
+    sorted_v = sorted(valores)
+    n = len(sorted_v)
+    q1 = sorted_v[n // 4]
+    q3 = sorted_v[(3 * n) // 4]
+    iqr = q3 - q1
+
+    if iqr == 0:
+        return timestamps, valores
+
+    # Límites de clip: mediana ± 5*IQR (permisivo para mantener picos R reales)
+    mediana = sorted_v[n // 2]
+    lim_inf = mediana - 5 * iqr
+    lim_sup = mediana + 5 * iqr
+
+    # Clip en lugar de eliminar (preserva la longitud de la serie)
+    valores_limpios = [max(lim_inf, min(lim_sup, v)) for v in valores]
+    return timestamps, valores_limpios
+
+
+def _interpolar_senal(timestamps, valores, n_puntos=200):
+    """
+    Interpolación lineal para señales de baja frecuencia (flujo, acce_z).
+    Crea una señal suavizada con más puntos intermedios.
+    """
+    if len(timestamps) < 2:
+        return timestamps, valores
+
+    t_min = timestamps[0]
+    t_max = timestamps[-1]
+
+    if t_min == t_max:
+        return timestamps, valores
+
+    # Crear timestamps uniformemente distribuidos
+    paso = (t_max - t_min) / (n_puntos - 1)
+    ts_nuevo = [int(t_min + i * paso) for i in range(n_puntos)]
+
+    # Interpolación lineal manual
+    vs_nuevo = []
+    j = 0
+    for t in ts_nuevo:
+        # Encontrar el segmento que contiene t
+        while j < len(timestamps) - 2 and timestamps[j + 1] < t:
+            j += 1
+        t0, t1 = timestamps[j], timestamps[min(j + 1, len(timestamps) - 1)]
+        v0, v1 = valores[j], valores[min(j + 1, len(valores) - 1)]
+        if t1 == t0:
+            vs_nuevo.append(v0)
+        else:
+            frac = (t - t0) / (t1 - t0)
+            vs_nuevo.append(v0 + frac * (v1 - v0))
+
+    return ts_nuevo, vs_nuevo
+
 
 # ─────────────────────────────────────────────
 # ENDPOINTS ESP32
@@ -617,7 +758,6 @@ def editar_paciente(paciente_id: int, data: PacienteModel, request: Request):
 
 @app.delete("/interrupciones/{interrupcion_id}")
 def eliminar_interrupcion(interrupcion_id: int):
-    """Elimina una interrupción y sus señales asociadas. Usado por el script de importación."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -687,6 +827,7 @@ def eliminar_usuario(usuario_id: int, request: Request):
 
 # ─────────────────────────────────────────────
 # ENDPOINT ESP32 — RECEPCIÓN UNIFICADA
+# FIX #1: Numeración consecutiva automática al recibir datos
 # ─────────────────────────────────────────────
 @app.post("/subir-datos")
 async def subir_datos(datos: DatosESP32):
@@ -739,11 +880,22 @@ async def subir_datos(datos: DatosESP32):
             conn.commit()
             hora_sesion_id = cursor.lastrowid
 
+        # FIX #1: Calcular el número consecutivo real contando todas las
+        # interrupciones previas de esta sesión (no solo de esta hora)
+        cursor.execute("""
+            SELECT COUNT(i.id) as total
+            FROM interrupciones i
+            JOIN horas_sesion hs ON i.hora_sesion_id = hs.id
+            WHERE hs.sesion_id = %s
+        """, (sesion_id,))
+        conteo = cursor.fetchone()
+        numero_consecutivo = (conteo[0] if conteo else 0) + 1
+
         cursor.execute("""
             INSERT INTO interrupciones
                 (hora_sesion_id, numero_interrupcion, hora_detectada, duracion_segundos, spo2, frecuencia_cardiaca)
             VALUES (%s, %s, %s, %s, %s, %s)
-        """, (hora_sesion_id, datos.no_apnea, datos.hora, datos.duracion, datos.spo2, datos.ecg))
+        """, (hora_sesion_id, numero_consecutivo, datos.hora, datos.duracion, datos.spo2, datos.ecg))
         conn.commit()
         interrupcion_id = cursor.lastrowid
 
@@ -761,10 +913,11 @@ async def subir_datos(datos: DatosESP32):
 
         return {
             "status": "success",
-            "paciente_id":     paciente_id,
-            "sesion_id":       sesion_id,
-            "hora_sesion_id":  hora_sesion_id,
-            "interrupcion_id": interrupcion_id
+            "paciente_id":         paciente_id,
+            "sesion_id":           sesion_id,
+            "hora_sesion_id":      hora_sesion_id,
+            "interrupcion_id":     interrupcion_id,
+            "numero_consecutivo":  numero_consecutivo
         }
 
     except Exception as e:
@@ -772,6 +925,8 @@ async def subir_datos(datos: DatosESP32):
 
 # ─────────────────────────────────────────────
 # PANEL ADMIN
+# FIX #1 y #2: Mostrar numero_consecutivo y hora_orden en el visor
+# FIX #3 y #4: El backend ya entrega señales limpias via /senales-completas
 # ─────────────────────────────────────────────
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel(request: Request):
@@ -801,7 +956,6 @@ def admin_panel(request: Request):
             .btn-primary { background: #7AAFC5; color: white; }
             .btn-danger { background: #D65C5C; color: white; font-size: 11px; padding: 5px 10px; }
             .btn-edit { background: #EEF5FB; color: #2C4A5A; font-size: 11px; padding: 5px 10px; border: 1px solid #D4E8F3; }
-            .btn-signal { background: #4A90B8; color: white; font-size: 11px; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; }
             table { width: 100%; border-collapse: collapse; }
             th { background: #EEF5FB; color: #2C4A5A; padding: 10px; text-align: left; font-size: 13px; border-bottom: 2px solid #D4E8F3; }
             td { padding: 10px; border-bottom: 1px solid #D4E8F3; font-size: 13px; }
@@ -846,6 +1000,7 @@ def admin_panel(request: Request):
             .tab-signal[data-tipo="acce_z"].active { background: #5CBE80; border-color: #5CBE80; }
             .tab-signal[data-tipo="flujo"].active  { background: #E0A55C; border-color: #E0A55C; }
             .loading-msg { text-align:center; color:#7AAFC5; padding:40px; font-size:13px; }
+            .fc-badge { background: #EEF8F2; color: #2E7D52; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
         </style>
     </head>
     <body>
@@ -904,8 +1059,6 @@ def admin_panel(request: Request):
             <!-- ── VISOR DE SEÑALES ── -->
             <div id="sec-senales" class="section">
                 <div class="visor-layout">
-
-                    <!-- Panel izquierdo: selección -->
                     <div>
                         <div class="visor-panel">
                             <h3>📁 Navegación</h3>
@@ -917,15 +1070,12 @@ def admin_panel(request: Request):
                             <select class="visor-select" id="sel-sesion" onchange="onSesionChange()" disabled>
                                 <option value="">— Seleccionar —</option>
                             </select>
-
                             <h3 style="margin-top:16px;">⚡ Apneas detectadas</h3>
                             <div id="interr-list" class="interr-list">
                                 <p style="font-size:12px;color:#5A7A8A;text-align:center;padding:20px 0;">Selecciona un paciente y sesión</p>
                             </div>
                         </div>
                     </div>
-
-                    <!-- Panel derecho: gráficas -->
                     <div>
                         <div id="charts-placeholder" class="no-signal">
                             <div style="font-size:40px;margin-bottom:12px;">📈</div>
@@ -940,7 +1090,7 @@ def admin_panel(request: Request):
                 </div>
             </div>
 
-        </div><!-- /content -->
+        </div>
 
         <!-- ── MODAL PACIENTE ── -->
         <div class="modal-bg" id="modal-paciente">
@@ -984,15 +1134,14 @@ def admin_panel(request: Request):
 
         <script>
             let pacientes = [];
-            let chartInstances = {};  // Guardar instancias de Chart.js para destruirlas
-            let senalesCache = {};    // Cache de señales por interrupcion_id
+            let chartInstances = {};
+            let senalesCache = {};
 
-            // ── Colores por tipo de señal ──────────────────────────────────────────
             const SIGNAL_CONFIG = {
-                ecg:    { label: 'ECG',             color: '#E05C5C', bg: 'rgba(224,92,92,0.1)',    unit: 'mV',   emoji: '❤️' },
-                spo2:   { label: 'SpO₂',            color: '#5C9AE0', bg: 'rgba(92,154,224,0.1)',   unit: '%',    emoji: '🩸' },
-                acce_z: { label: 'Aceleración Z',   color: '#5CBE80', bg: 'rgba(92,190,128,0.1)',   unit: 'm/s²', emoji: '🔵' },
-                flujo:  { label: 'Flujo resp.',     color: '#E0A55C', bg: 'rgba(224,165,92,0.1)',   unit: 'ADC',  emoji: '💨' },
+                ecg:    { label: 'ECG',           color: '#E05C5C', bg: 'rgba(224,92,92,0.08)',   unit: 'mV',   emoji: '❤️',  stepped: false },
+                spo2:   { label: 'SpO₂',          color: '#5C9AE0', bg: 'rgba(92,154,224,0.1)',   unit: '%',    emoji: '🩸',  stepped: false },
+                acce_z: { label: 'Aceleración Z',  color: '#5CBE80', bg: 'rgba(92,190,128,0.1)',  unit: 'm/s²', emoji: '🔵',  stepped: false },
+                flujo:  { label: 'Flujo resp.',    color: '#E0A55C', bg: 'rgba(224,165,92,0.1)',   unit: 'ADC',  emoji: '💨',  stepped: false },
             };
 
             function mostrarToast(msg) {
@@ -1037,7 +1186,6 @@ def admin_panel(request: Request):
                     '<p style="font-size:12px;color:#5A7A8A;text-align:center;padding:20px 0;">Selecciona una sesión</p>';
                 resetCharts();
                 if (!pacId) return;
-
                 const res = await fetch('/sesiones/por-paciente/' + pacId);
                 const sesiones = await res.json();
                 sesiones.forEach(s => {
@@ -1060,6 +1208,15 @@ def admin_panel(request: Request):
                 document.getElementById('interr-list').innerHTML =
                     '<div class="loading-msg">Cargando apneas...</div>';
 
+                // FIX #2: Obtener horas con hora_orden para mapear hora real → hora consecutiva
+                const resHoras = await fetch('/horas-sesion/' + sesId);
+                const horas = await resHoras.json();
+                // Construir mapa: numero_hora_real → hora_orden (1,2,3...)
+                window._horaOrdenMap = {};
+                horas.forEach(h => {
+                    window._horaOrdenMap[h.numero_hora] = h.hora_orden;
+                });
+
                 const res = await fetch('/interrupciones-sesion/' + sesId);
                 const interrupciones = await res.json();
                 renderInterrList(interrupciones);
@@ -1071,12 +1228,16 @@ def admin_panel(request: Request):
                     cont.innerHTML = '<p style="font-size:12px;color:#5A7A8A;text-align:center;padding:20px 0;">No hay apneas registradas en esta sesión</p>';
                     return;
                 }
-                cont.innerHTML = interrupciones.map(i => {
+                cont.innerHTML = interrupciones.map((i, globalIdx) => {
                     const spo2Class = i.spo2 < 90 ? 'badge-crit' : i.spo2 < 95 ? 'badge-warn' : 'badge-ok';
                     const tieneSenales = i.total_senales > 0;
+                    // FIX #1: Usar numero_consecutivo del backend o el índice global
+                    const numApnea = i.numero_consecutivo || (globalIdx + 1);
+                    // FIX #2: hora_orden consecutiva desde el mapa
+                    const horaOrden = (window._horaOrdenMap && window._horaOrdenMap[i.numero_hora]) || i.numero_hora;
                     return `
                     <div class="interr-item" id="item-${i.id}" onclick="cargarSenales(${i.id}, this)">
-                        <div class="interr-title">Apnea #${i.numero_interrupcion} · Hora ${i.numero_hora}:00</div>
+                        <div class="interr-title">Apnea #${numApnea} · Hora ${horaOrden}</div>
                         <div class="interr-meta">
                             🕐 ${i.hora_detectada || '--'} &nbsp;|&nbsp; ⏱️ ${i.duracion_segundos}s
                         </div>
@@ -1092,7 +1253,6 @@ def admin_panel(request: Request):
             }
 
             async function cargarSenales(interrupcionId, el) {
-                // Marcar como seleccionado
                 document.querySelectorAll('.interr-item').forEach(i => i.classList.remove('selected'));
                 el.classList.add('selected');
 
@@ -1100,13 +1260,11 @@ def admin_panel(request: Request):
                 document.getElementById('charts-container').style.display = 'block';
                 document.getElementById('charts-area').innerHTML = '<div class="loading-msg">⏳ Cargando señales...</div>';
 
-                // Obtener metadatos de la interrupción desde el DOM
                 const titulo = el.querySelector('.interr-title').textContent;
                 const meta   = el.querySelector('.interr-meta').textContent;
                 document.getElementById('interr-info').innerHTML =
                     '<strong>' + titulo + '</strong> &nbsp;·&nbsp; ' + meta;
 
-                // Usar cache si existe
                 let data = senalesCache[interrupcionId];
                 if (!data) {
                     const res = await fetch('/senales-completas/' + interrupcionId);
@@ -1117,17 +1275,15 @@ def admin_panel(request: Request):
                 const tipos = Object.keys(data);
                 if (!tipos.length) {
                     document.getElementById('charts-area').innerHTML =
-                        '<div class="no-signal" style="padding:40px;">⚠️ Esta apnea no tiene señales almacenadas.<br><small>Las señales se envían en el reinicio del ESP32.</small></div>';
+                        '<div class="no-signal" style="padding:40px;">⚠️ Esta apnea no tiene señales almacenadas.</div>';
                     document.getElementById('tabs-signal').innerHTML = '';
                     return;
                 }
 
-                // Renderizar tabs de señales
                 renderTabsSignal(tipos, data);
             }
 
             function renderTabsSignal(tipos, data) {
-                // Ordenar tipos: ECG primero
                 const orden = ['ecg', 'spo2', 'acce_z', 'flujo'];
                 const tiposOrdenados = orden.filter(t => tipos.includes(t))
                     .concat(tipos.filter(t => !orden.includes(t)));
@@ -1136,20 +1292,16 @@ def admin_panel(request: Request):
                 tabsCont.innerHTML = tiposOrdenados.map((tipo, idx) => {
                     const cfg = SIGNAL_CONFIG[tipo] || { label: tipo, emoji: '📶' };
                     const n = data[tipo] ? data[tipo].timestamps.length : 0;
-                    return `<span class="tab-signal ${idx===0?'active':''}" data-tipo="${tipo}"
-                        onclick="activarTabSignal('${tipo}', tiposOrdenados, data)">
+                    return `<span class="tab-signal ${idx===0?'active':''}" data-tipo="${tipo}">
                         ${cfg.emoji} ${cfg.label} <span style="opacity:0.7;font-size:10px;">(${n})</span>
                     </span>`;
                 }).join('');
 
-                // Guardar referencia en window para el onclick
-                window._signalData = data;
+                window._signalData  = data;
                 window._signalTipos = tiposOrdenados;
 
-                // Mostrar primera señal
                 mostrarChartTipo(tiposOrdenados[0], data);
 
-                // Reasignar eventos
                 document.querySelectorAll('.tab-signal').forEach(tab => {
                     tab.onclick = () => {
                         document.querySelectorAll('.tab-signal').forEach(t => t.classList.remove('active'));
@@ -1159,11 +1311,37 @@ def admin_panel(request: Request):
                 });
             }
 
-            function activarTabSignal(tipo, tipos, data) {
-                document.querySelectorAll('.tab-signal').forEach(t => {
-                    t.classList.toggle('active', t.dataset.tipo === tipo);
-                });
-                mostrarChartTipo(tipo, data);
+            // FIX #5: Calcular FC desde picos R del ECG
+            function calcularFC(timestamps, valores) {
+                if (timestamps.length < 10) return null;
+                const t0 = timestamps[0];
+                const t_seg = timestamps.map(t => (t - t0) / 1000.0);
+                const duracionTotal = t_seg[t_seg.length - 1];
+                if (duracionTotal <= 0) return null;
+
+                // Umbral: 70% del valor máximo
+                const maxVal = Math.max(...valores);
+                const umbral = maxVal * 0.7;
+                if (umbral <= 0) return null;
+
+                // Detectar picos R (máximos locales por encima del umbral)
+                let picos = 0;
+                let enPico = false;
+                for (let i = 1; i < valores.length - 1; i++) {
+                    if (valores[i] > umbral) {
+                        if (!enPico && valores[i] >= valores[i-1] && valores[i] >= valores[i+1]) {
+                            picos++;
+                            enPico = true;
+                        }
+                    } else {
+                        enPico = false;
+                    }
+                }
+
+                if (picos < 2) return null;
+                // FC = picos / duración_en_minutos
+                const fc = Math.round((picos / duracionTotal) * 60);
+                return (fc >= 30 && fc <= 250) ? fc : null;
             }
 
             function mostrarChartTipo(tipo, data) {
@@ -1176,28 +1354,57 @@ def admin_panel(request: Request):
                     return;
                 }
 
-                // Destruir chart anterior si existe
                 if (chartInstances[tipo]) {
                     chartInstances[tipo].destroy();
                     delete chartInstances[tipo];
                 }
 
+                // FIX #5: Calcular FC si es ECG
+                let fcHtml = '';
+                if (tipo === 'ecg') {
+                    const fc = calcularFC(señal.timestamps, señal.valores);
+                    if (fc) {
+                        fcHtml = `<div style="margin-bottom:10px;">
+                            <span style="font-size:12px;color:#5A7A8A;">Frecuencia cardiaca estimada: </span>
+                            <span class="fc-badge">❤️ ${fc} lpm</span>
+                        </div>`;
+                    }
+                }
+
                 const canvasId = 'chart-' + tipo;
+                const min = Math.min(...señal.valores);
+                const max = Math.max(...señal.valores);
+
                 area.innerHTML = `
                     <div class="chart-card">
                         <h4>${cfg.emoji} ${cfg.label} — ${señal.timestamps.length} muestras</h4>
+                        ${fcHtml}
                         <canvas id="${canvasId}" height="180"></canvas>
                     </div>
                     <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:4px;">
-                        ${statBox('Mínimo', Math.min(...señal.valores).toFixed(2), cfg.unit)}
-                        ${statBox('Máximo', Math.max(...señal.valores).toFixed(2), cfg.unit)}
+                        ${statBox('Mínimo', min.toFixed(2), cfg.unit)}
+                        ${statBox('Máximo', max.toFixed(2), cfg.unit)}
                         ${statBox('Promedio', (señal.valores.reduce((a,b)=>a+b,0)/señal.valores.length).toFixed(2), cfg.unit)}
                     </div>`;
 
                 const ctx = document.getElementById(canvasId).getContext('2d');
-                // Calcular paso de tiempo relativo en ms
                 const t0 = señal.timestamps[0];
                 const labels = señal.timestamps.map(t => ((t - t0) / 1000).toFixed(2) + 's');
+
+                // FIX #3: Para ECG, usar yMin/yMax dinámico basado en datos ya limpios
+                const yPadding = (max - min) * 0.1 || 0.1;
+                const scalesOpts = tipo === 'ecg' ? {
+                    x: { ticks: { maxTicksLimit: 12, font: { size: 10 }, color: '#5A7A8A' }, grid: { color: '#EEF5FB' } },
+                    y: {
+                        min: min - yPadding,
+                        max: max + yPadding,
+                        ticks: { font: { size: 10 }, color: '#5A7A8A' },
+                        grid: { color: '#EEF5FB' }
+                    }
+                } : {
+                    x: { ticks: { maxTicksLimit: 12, font: { size: 10 }, color: '#5A7A8A' }, grid: { color: '#EEF5FB' } },
+                    y: { ticks: { font: { size: 10 }, color: '#5A7A8A' }, grid: { color: '#EEF5FB' } }
+                };
 
                 chartInstances[tipo] = new Chart(ctx, {
                     type: 'line',
@@ -1209,10 +1416,10 @@ def admin_panel(request: Request):
                             borderColor: cfg.color,
                             backgroundColor: cfg.bg,
                             borderWidth: tipo === 'ecg' ? 1.2 : 1.8,
-                            pointRadius: señal.timestamps.length > 500 ? 0 : 2,
+                            pointRadius: señal.timestamps.length > 200 ? 0 : 3,
                             pointHoverRadius: 4,
                             fill: tipo !== 'ecg',
-                            tension: tipo === 'ecg' ? 0 : 0.3,
+                            tension: tipo === 'ecg' ? 0 : 0.4,
                         }]
                     },
                     options: {
@@ -1226,20 +1433,7 @@ def admin_panel(request: Request):
                                 }
                             }
                         },
-                        scales: {
-                            x: {
-                                ticks: {
-                                    maxTicksLimit: 12,
-                                    font: { size: 10 },
-                                    color: '#5A7A8A'
-                                },
-                                grid: { color: '#EEF5FB' }
-                            },
-                            y: {
-                                ticks: { font: { size: 10 }, color: '#5A7A8A' },
-                                grid: { color: '#EEF5FB' }
-                            }
-                        }
+                        scales: scalesOpts
                     }
                 });
             }
