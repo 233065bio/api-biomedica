@@ -276,7 +276,7 @@ def logout():
     return response
 
 # ─────────────────────────────────────────────
-# ENDPOINTS SESIONES (para app de escritorio)
+# ENDPOINTS SESIONES
 # ─────────────────────────────────────────────
 @app.get("/sesion/por-paciente/{paciente_id}")
 def sesion_por_paciente_id(paciente_id: int):
@@ -314,9 +314,6 @@ def sesion_por_nombre(nombre: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─────────────────────────────────────────────
-# ENDPOINT: SESIONES POR PACIENTE (para visor)
-# ─────────────────────────────────────────────
 @app.get("/sesiones/por-paciente/{paciente_id}")
 def sesiones_por_paciente(paciente_id: int):
     try:
@@ -341,7 +338,6 @@ def sesiones_por_paciente(paciente_id: int):
 
 # ─────────────────────────────────────────────
 # ENDPOINTS HORAS DE SESIÓN
-# FIX #2: Añadir hora_orden (1,2,3...) y hora_real para distinguirlos
 # ─────────────────────────────────────────────
 @app.get("/horas-sesion/{sesion_id}")
 def horas_sesion_endpoint(sesion_id: int):
@@ -366,8 +362,6 @@ def horas_sesion_endpoint(sesion_id: int):
             r = dict(r)
             r["hora_inicio"] = timedelta_a_str(r.get("hora_inicio"))
             r["hora_fin"]    = timedelta_a_str(r.get("hora_fin"))
-            # FIX #2: hora_orden es el número consecutivo (1, 2, 3...)
-            # hora_real es el numero_hora original (ej: 20, 21, 22...)
             r["hora_orden"]  = idx + 1
             r["hora_real"]   = r["numero_hora"]
             result.append(r)
@@ -377,7 +371,6 @@ def horas_sesion_endpoint(sesion_id: int):
 
 # ─────────────────────────────────────────────
 # ENDPOINTS INTERRUPCIONES
-# FIX #1: Renumerar consecutivamente dentro de la sesión
 # ─────────────────────────────────────────────
 @app.get("/interrupciones/{hora_sesion_id}")
 def interrupciones_por_hora(hora_sesion_id: int):
@@ -385,7 +378,6 @@ def interrupciones_por_hora(hora_sesion_id: int):
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
 
-        # Obtener la sesion_id de esta hora para renumerar en contexto de sesión
         cursor.execute("""
             SELECT sesion_id FROM horas_sesion WHERE id = %s
         """, (hora_sesion_id,))
@@ -400,7 +392,6 @@ def interrupciones_por_hora(hora_sesion_id: int):
         """, (hora_sesion_id,))
         rows = cursor.fetchall()
 
-        # FIX #1: Calcular el offset para numeración consecutiva global por sesión
         offset = 0
         if sesion_row:
             sesion_id = sesion_row["sesion_id"]
@@ -421,17 +412,12 @@ def interrupciones_por_hora(hora_sesion_id: int):
         for local_idx, r in enumerate(rows):
             r = dict(r)
             r["hora_detectada"] = timedelta_a_str(r.get("hora_detectada"))
-            # FIX #1: numero_consecutivo = offset de apneas anteriores + posición local
             r["numero_consecutivo"] = offset + local_idx + 1
             result.append(r)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─────────────────────────────────────────────
-# ENDPOINT: INTERRUPCIONES POR SESIÓN (para visor)
-# FIX #1: Añadir numero_consecutivo global
-# ─────────────────────────────────────────────
 @app.get("/interrupciones-sesion/{sesion_id}")
 def interrupciones_por_sesion(sesion_id: int):
     try:
@@ -449,18 +435,6 @@ def interrupciones_por_sesion(sesion_id: int):
         """, (sesion_id,))
         rows = cursor.fetchall()
 
-        # FIX #2: Obtener hora_orden (consecutivo) para cada hora real
-        cursor.execute("""
-            SELECT id, numero_hora,
-                   ROW_NUMBER() OVER (ORDER BY numero_hora) AS hora_orden
-            FROM horas_sesion
-            WHERE sesion_id = %s
-        """, (sesion_id,))
-        horas_rows = cursor.fetchall()
-        hora_orden_map = {h["id"] if "id" in h else h[0]: h["hora_orden"] if "hora_orden" in h else h[2]
-                          for h in horas_rows}
-
-        # Reconstruir mapa con ids correctos
         cursor.execute("""
             SELECT hs.id as hs_id, hs.numero_hora,
                    ROW_NUMBER() OVER (ORDER BY hs.numero_hora) AS hora_orden
@@ -479,7 +453,6 @@ def interrupciones_por_sesion(sesion_id: int):
         for global_idx, r in enumerate(rows):
             r = dict(r)
             r["hora_detectada"] = timedelta_a_str(r.get("hora_detectada"))
-            # FIX #1: Número consecutivo global
             r["numero_consecutivo"] = global_idx + 1
             result.append(r)
         return result
@@ -523,11 +496,6 @@ def senales_por_interrupcion(interrupcion_id: int, tipo: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─────────────────────────────────────────────
-# ENDPOINT: TODAS LAS SEÑALES
-# FIX #3: Filtrar outliers estadísticos del ECG (IQR)
-# FIX #4: Interpolar señales de baja frecuencia (flujo, acce_z)
-# ─────────────────────────────────────────────
 @app.get("/senales-completas/{interrupcion_id}")
 def senales_completas(interrupcion_id: int):
     """Devuelve todas las señales agrupadas por tipo, con limpieza de outliers."""
@@ -544,7 +512,6 @@ def senales_completas(interrupcion_id: int):
         cursor.close()
         conn.close()
 
-        # Agrupar por tipo de señal
         raw = {}
         for r in rows:
             tipo = r["tipo_senal"]
@@ -561,10 +528,7 @@ def senales_completas(interrupcion_id: int):
                 ts, vs = _limpiar_outliers_ecg(ts, vs)
             resultado[tipo] = {"timestamps": ts, "valores": vs}
 
-        # ── Construir señal de frecuencia respiratoria desde datos reales ──
-        # Con streaming real, flujo y acc_z tienen muchas muestras.
-        # Usamos la señal con más variación, la normalizamos a [-1, 1]
-        # y aplicamos un filtro de media móvil para suavizar el ruido.
+        # Construir señal respiratoria desde SOLO flujo
         ts_flujo = raw.get("flujo",  {}).get("timestamps", [])
         vs_flujo = raw.get("flujo",  {}).get("valores",    [])
         ts_accz  = raw.get("acce_z", {}).get("timestamps", [])
@@ -585,31 +549,19 @@ def senales_completas(interrupcion_id: int):
 
 
 def _limpiar_outliers_ecg(timestamps, valores):
-    """
-    Elimina outliers del ECG usando el método IQR.
-    Valores que excedan mediana ± 5*IQR se recortan (clip) al límite,
-    preservando la forma de la onda pero evitando que un pico enorme
-    comprima el resto de la escala.
-    """
+    """Clip outliers del ECG usando IQR x5, preservando longitud."""
     if len(valores) < 10:
         return timestamps, valores
-
-    import statistics
     sorted_v = sorted(valores)
     n = len(sorted_v)
     q1 = sorted_v[n // 4]
     q3 = sorted_v[(3 * n) // 4]
     iqr = q3 - q1
-
     if iqr == 0:
         return timestamps, valores
-
-    # Límites de clip: mediana ± 5*IQR (permisivo para mantener picos R reales)
     mediana = sorted_v[n // 2]
     lim_inf = mediana - 5 * iqr
     lim_sup = mediana + 5 * iqr
-
-    # Clip en lugar de eliminar (preserva la longitud de la serie)
     valores_limpios = [max(lim_inf, min(lim_sup, v)) for v in valores]
     return timestamps, valores_limpios
 
@@ -643,24 +595,14 @@ import math as _math
 
 def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
     """
-    Construye la señal de frecuencia respiratoria a partir de datos reales
-    de streaming (flujo y/o acc_z con muchas muestras).
+    Construye la señal respiratoria usando SOLO la señal de flujo.
+    - Interpola a 500 puntos uniformes para curva continua.
+    - Aplica doble pasada de media móvil para eliminar picos de ruido.
+    - Devuelve valores ADC reales (sin normalizar) para visualización directa.
 
-    Algoritmo:
-    1. Elige la señal con mayor variación (flujo o acc_z).
-    2. Si ambas tienen datos, las combina ponderadas (flujo 60%, accz 40%).
-    3. Aplica media móvil para eliminar ruido de alta frecuencia.
-    4. Normaliza a rango [-1, 1] para visualización uniforme.
-    5. Convierte timestamps a segundos relativos.
-
-    Si hay pocas muestras (≤2), genera una onda senoidal informada por la
-    amplitud de los datos reales (detección de apnea incluida).
+    Si no hay datos de flujo, genera onda senoidal en rango ADC típico (120-190).
     """
-    def rango(vs):
-        return max(vs) - min(vs) if len(vs) > 1 else 0.0
-
-    def media_movil(valores, ventana=5):
-        """Suavizado por media móvil simple."""
+    def media_movil(valores, ventana):
         if len(valores) <= ventana:
             return valores
         resultado = []
@@ -670,22 +612,12 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
             resultado.append(sum(valores[inicio:fin]) / (fin - inicio))
         return resultado
 
-    def normalizar(valores):
-        """Normaliza a [-1, 1] centrado en la media."""
-        if not valores:
-            return valores
-        media = sum(valores) / len(valores)
-        centrado = [v - media for v in valores]
-        amp = max(abs(v) for v in centrado) or 1.0
-        return [v / amp for v in centrado]
-
     def interpolar_uniforme(ts, vs, n=500):
-        """Re-muestrea a n puntos uniformes."""
         if len(ts) < 2:
-            return ts, vs
+            return ts[:], vs[:]
         t0, t1 = ts[0], ts[-1]
         if t0 == t1:
-            return ts, vs
+            return ts[:], vs[:]
         paso = (t1 - t0) / (n - 1)
         ts_n = [int(t0 + i * paso) for i in range(n)]
         vs_n = []
@@ -699,81 +631,28 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
             vs_n.append(v_a + frac * (v_b - v_a))
         return ts_n, vs_n
 
-    rang_f = rango(vs_flujo)
-    rang_a = rango(vs_accz)
+    # Usar SOLO flujo si hay suficientes muestras
+    if len(ts_flujo) > 2:
+        ts_u, vs_interp = interpolar_uniforme(ts_flujo, vs_flujo, 500)
+        # Primera pasada: ventana ~8% de los puntos
+        ventana1 = max(5, len(vs_interp) // 12)
+        vs_suave = media_movil(vs_interp, ventana1)
+        # Segunda pasada: ventana ~4% para afinar
+        ventana2 = max(3, ventana1 // 2)
+        vs_suave = media_movil(vs_suave, ventana2)
+        t0 = ts_u[0]
+        ts_rel = [t - t0 for t in ts_u]
+        return ts_rel, [round(v, 3) for v in vs_suave]
 
-    # Caso: streaming real con suficientes muestras
-    tiene_flujo = len(ts_flujo) > 2
-    tiene_accz  = len(ts_accz)  > 2
-
-    if tiene_flujo or tiene_accz:
-        if tiene_flujo and tiene_accz:
-            # Combinar: re-muestrear ambas al mismo grid y ponderar
-            N = 500
-            ts_base = ts_flujo if len(ts_flujo) >= len(ts_accz) else ts_accz
-            ts_u, vs_f_u = interpolar_uniforme(ts_flujo, vs_flujo, N) if tiene_flujo else ([], [])
-            _,    vs_a_u = interpolar_uniforme(ts_accz,  vs_accz,  N) if tiene_accz  else ([], [])
-
-            if vs_f_u and vs_a_u:
-                norm_f = normalizar(vs_f_u)
-                norm_a = normalizar(vs_a_u)
-                # Peso según variación relativa
-                total_rang = rang_f + rang_a or 1.0
-                w_f = rang_f / total_rang
-                w_a = rang_a / total_rang
-                vs_comb = [w_f * f + w_a * a for f, a in zip(norm_f, norm_a)]
-                ts_out = ts_u
-            elif vs_f_u:
-                vs_comb = normalizar(vs_f_u)
-                ts_out  = ts_u
-            else:
-                ts_u2, vs_a_u2 = interpolar_uniforme(ts_accz, vs_accz, N)
-                vs_comb = normalizar(vs_a_u2)
-                ts_out  = ts_u2
-        elif tiene_flujo:
-            ts_out, vs_raw_u = interpolar_uniforme(ts_flujo, vs_flujo, 500)
-            vs_comb = normalizar(vs_raw_u)
-        else:
-            ts_out, vs_raw_u = interpolar_uniforme(ts_accz, vs_accz, 500)
-            vs_comb = normalizar(vs_raw_u)
-
-        # Suavizado: ventana proporcional a la cantidad de datos
-        ventana = max(3, len(vs_comb) // 40)
-        vs_suave = media_movil(vs_comb, ventana)
-
-        # Convertir timestamps a ms relativos desde 0
-        t0 = ts_out[0]
-        ts_rel = [t - t0 for t in ts_out]
-        return ts_rel, [round(v, 5) for v in vs_suave]
-
-    else:
-        # Pocas muestras: onda senoidal informada por amplitud real
-        duracion_ms = 20000
-        if ts_flujo and len(ts_flujo) > 1:
-            duracion_ms = ts_flujo[-1] - ts_flujo[0]
-        elif ts_accz and len(ts_accz) > 1:
-            duracion_ms = ts_accz[-1] - ts_accz[0]
-
-        duracion_seg = max(duracion_ms / 1000.0, 1.0)
-        # Detectar apnea por poca variación
-        variacion = max(rang_f, rang_a)
-        es_apnea  = variacion < 2.0
-        amp = 0.05 if es_apnea else 1.0
-        freq = 0.25  # 15 rpm
-
-        N = 500
-        ts_out = [int(i * duracion_ms / (N - 1)) for i in range(N)]
-        vs_out = []
-        for t in ts_out:
-            t_seg = t / 1000.0
-            fase = (t_seg * freq * 2 * _math.pi) % (2 * _math.pi)
-            if fase < 2 * _math.pi * 0.4:
-                v = amp * _math.sin(fase / 0.4 * _math.pi / 2) ** 2
-            else:
-                v = amp * _math.cos((fase - 2 * _math.pi * 0.4) / 0.6 * _math.pi / 2) ** 2
-            # Centrar en 0
-            vs_out.append(round(v - amp / 2, 5))
-        return ts_out, vs_out
+    # Fallback: onda senoidal en rango ADC típico si no hay flujo
+    duracion_ms = 20000
+    if ts_accz and len(ts_accz) > 1:
+        duracion_ms = ts_accz[-1] - ts_accz[0]
+    duracion_ms = max(duracion_ms, 1000)
+    N = 500
+    ts_out = [int(i * duracion_ms / (N - 1)) for i in range(N)]
+    vs_out = [round(155 + 30 * _math.sin(2 * _math.pi * 0.25 * t / 1000.0), 3) for t in ts_out]
+    return ts_out, vs_out
 
 
 # ─────────────────────────────────────────────
@@ -963,9 +842,11 @@ def eliminar_usuario(usuario_id: int, request: Request):
     conn.close()
     return {"status": "success"}
 
+async def guardar_usuario():
+    pass  # handled above
+
 # ─────────────────────────────────────────────
 # ENDPOINT ESP32 — RECEPCIÓN UNIFICADA
-# FIX #1: Numeración consecutiva automática al recibir datos
 # ─────────────────────────────────────────────
 @app.post("/subir-datos")
 async def subir_datos(datos: DatosESP32):
@@ -1018,8 +899,6 @@ async def subir_datos(datos: DatosESP32):
             conn.commit()
             hora_sesion_id = cursor.lastrowid
 
-        # FIX #1: Calcular el número consecutivo real contando todas las
-        # interrupciones previas de esta sesión (no solo de esta hora)
         cursor.execute("""
             SELECT COUNT(i.id) as total
             FROM interrupciones i
@@ -1063,8 +942,7 @@ async def subir_datos(datos: DatosESP32):
 
 # ─────────────────────────────────────────────
 # PANEL ADMIN
-# FIX #1 y #2: Mostrar numero_consecutivo y hora_orden en el visor
-# FIX #3 y #4: El backend ya entrega señales limpias via /senales-completas
+# Cambios: ECG eje Y dinámico, Flujo resp en ADC real
 # ─────────────────────────────────────────────
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel(request: Request):
@@ -1109,8 +987,6 @@ def admin_panel(request: Request):
             .badge-crit { background: #FFF0EE; color: #A02020; }
             .toast { position: fixed; bottom: 30px; right: 30px; background: #2C4A5A; color: white; padding: 12px 24px; border-radius: 6px; display: none; z-index: 999; }
             .toast.show { display: block; }
-
-            /* ── Visor de Señales ── */
             .visor-layout { display: grid; grid-template-columns: 300px 1fr; gap: 20px; }
             .visor-panel { background: #EEF5FB; border-radius: 8px; border: 1px solid #D4E8F3; padding: 16px; }
             .visor-panel h3 { font-size: 13px; color: #5A7A8A; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -1154,8 +1030,6 @@ def admin_panel(request: Request):
             <div class="tab" onclick="cambiarTab('senales', event)">📈 Visor de Señales</div>
         </div>
         <div class="content">
-
-            <!-- ── PACIENTES ── -->
             <div id="sec-pacientes" class="section active">
                 <div class="toolbar">
                     <input class="search" id="buscar-pac" placeholder="🔍 Buscar paciente..." oninput="filtrarPacientes()">
@@ -1168,8 +1042,6 @@ def admin_panel(request: Request):
                     <tbody id="tbody-pacientes"></tbody>
                 </table>
             </div>
-
-            <!-- ── USUARIOS ── -->
             <div id="sec-usuarios" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Gestión de usuarios</span>
@@ -1180,11 +1052,9 @@ def admin_panel(request: Request):
                     <tbody id="tbody-usuarios"></tbody>
                 </table>
             </div>
-
-            <!-- ── MONITOREO ESP32 ── -->
             <div id="sec-monitoreo" class="section">
                 <div class="toolbar">
-                    <span style="font-size:13px; color:#5A7A8A;">Registros históricos enviados por ESP32 (Solo lectura)</span>
+                    <span style="font-size:13px; color:#5A7A8A;">Registros históricos enviados por ESP32</span>
                     <button class="btn btn-primary" onclick="cargarMonitoreo()">🔄 Actualizar</button>
                 </div>
                 <table>
@@ -1194,8 +1064,6 @@ def admin_panel(request: Request):
                     <tbody id="tbody-monitoreo"></tbody>
                 </table>
             </div>
-
-            <!-- ── VISOR DE SEÑALES ── -->
             <div id="sec-senales" class="section">
                 <div class="visor-layout">
                     <div>
@@ -1228,10 +1096,9 @@ def admin_panel(request: Request):
                     </div>
                 </div>
             </div>
-
         </div>
 
-        <!-- ── MODAL PACIENTE ── -->
+        <!-- MODAL PACIENTE -->
         <div class="modal-bg" id="modal-paciente">
             <div class="modal">
                 <h2 id="modal-pac-titulo">Paciente</h2>
@@ -1256,7 +1123,7 @@ def admin_panel(request: Request):
             </div>
         </div>
 
-        <!-- ── MODAL USUARIO ── -->
+        <!-- MODAL USUARIO -->
         <div class="modal-bg" id="modal-usuario">
             <div class="modal">
                 <h2>Nuevo Usuario</h2>
@@ -1276,12 +1143,19 @@ def admin_panel(request: Request):
             let chartInstances = {};
             let senalesCache = {};
 
+            // ── CAMBIO: frecuencia_respiratoria ahora muestra ADC real (no normalizado) ──
             const SIGNAL_CONFIG = {
-                ecg:    { label: 'ECG',                       color: '#E05C5C', bg: 'rgba(224,92,92,0.08)',   unit: 'mV',   emoji: '❤️',  yMin: -35, yMax: 35 },
-                spo2:   { label: 'SpO₂',                      color: '#5C9AE0', bg: 'rgba(92,154,224,0.1)',   unit: '%',    emoji: '🩸',  yMin: null, yMax: null },
-                acce_z: { label: 'Aceleración Z',              color: '#5CBE80', bg: 'rgba(92,190,128,0.1)',  unit: 'm/s²', emoji: '🔵',  yMin: null, yMax: null },
-                flujo:  { label: 'Flujo resp.',                color: '#E0A55C', bg: 'rgba(224,165,92,0.1)',   unit: 'ADC',  emoji: '💨',  yMin: null, yMax: null },
-                frecuencia_respiratoria: { label: 'Frec. Respiratoria', color: '#4A9E6B', bg: 'rgba(74,158,107,0.12)', unit: 'amp', emoji: '🌬️', yMin: -0.15, yMax: 1.15 },
+                ecg:    { label: 'ECG',              color: '#E05C5C', bg: 'rgba(224,92,92,0.08)',   unit: 'mV',   emoji: '❤️'  },
+                spo2:   { label: 'SpO₂',             color: '#5C9AE0', bg: 'rgba(92,154,224,0.1)',   unit: '%',    emoji: '🩸'  },
+                acce_z: { label: 'Aceleración Z',    color: '#5CBE80', bg: 'rgba(92,190,128,0.1)',   unit: 'm/s²', emoji: '🔵'  },
+                flujo:  { label: 'Flujo resp.',      color: '#E0A55C', bg: 'rgba(224,165,92,0.1)',   unit: 'ADC',  emoji: '💨'  },
+                frecuencia_respiratoria: {
+                    label: 'Flujo Resp. (suavizado)',
+                    color: '#4A9E6B',
+                    bg: 'rgba(74,158,107,0.12)',
+                    unit: 'ADC',   // valores ADC reales del flujo
+                    emoji: '🌬️'
+                },
             };
 
             function mostrarToast(msg) {
@@ -1348,10 +1222,8 @@ def admin_panel(request: Request):
                 document.getElementById('interr-list').innerHTML =
                     '<div class="loading-msg">Cargando apneas...</div>';
 
-                // FIX #2: Obtener horas con hora_orden para mapear hora real → hora consecutiva
                 const resHoras = await fetch('/horas-sesion/' + sesId);
                 const horas = await resHoras.json();
-                // Construir mapa: numero_hora_real → hora_orden (1,2,3...)
                 window._horaOrdenMap = {};
                 horas.forEach(h => {
                     window._horaOrdenMap[h.numero_hora] = h.hora_orden;
@@ -1371,9 +1243,7 @@ def admin_panel(request: Request):
                 cont.innerHTML = interrupciones.map((i, globalIdx) => {
                     const spo2Class = i.spo2 < 90 ? 'badge-crit' : i.spo2 < 95 ? 'badge-warn' : 'badge-ok';
                     const tieneSenales = i.total_senales > 0;
-                    // FIX #1: Usar numero_consecutivo del backend o el índice global
                     const numApnea = i.numero_consecutivo || (globalIdx + 1);
-                    // FIX #2: hora_orden consecutiva desde el mapa
                     const horaOrden = (window._horaOrdenMap && window._horaOrdenMap[i.numero_hora]) || i.numero_hora;
                     return `
                     <div class="interr-item" id="item-${i.id}" onclick="cargarSenales(${i.id}, this)">
@@ -1395,7 +1265,6 @@ def admin_panel(request: Request):
             async function cargarSenales(interrupcionId, el) {
                 document.querySelectorAll('.interr-item').forEach(i => i.classList.remove('selected'));
                 el.classList.add('selected');
-
                 document.getElementById('charts-placeholder').style.display = 'none';
                 document.getElementById('charts-container').style.display = 'block';
                 document.getElementById('charts-area').innerHTML = '<div class="loading-msg">⏳ Cargando señales...</div>';
@@ -1419,12 +1288,10 @@ def admin_panel(request: Request):
                     document.getElementById('tabs-signal').innerHTML = '';
                     return;
                 }
-
                 renderTabsSignal(tipos, data);
             }
 
             function renderTabsSignal(tipos, data) {
-                // Orden: Frec. Respiratoria primero, luego ECG, SpO2, señales raw
                 const orden = ['frecuencia_respiratoria', 'ecg', 'spo2', 'acce_z', 'flujo'];
                 const tiposOrdenados = orden.filter(t => tipos.includes(t))
                     .concat(tipos.filter(t => !orden.includes(t)));
@@ -1440,7 +1307,6 @@ def admin_panel(request: Request):
 
                 window._signalData  = data;
                 window._signalTipos = tiposOrdenados;
-
                 mostrarChartTipo(tiposOrdenados[0], data);
 
                 document.querySelectorAll('.tab-signal').forEach(tab => {
@@ -1452,7 +1318,6 @@ def admin_panel(request: Request):
                 });
             }
 
-            // ── Calcular FC desde picos R del ECG ─────────────────────────────
             function calcularFC(timestamps, valores) {
                 if (timestamps.length < 10) return null;
                 const t0 = timestamps[0];
@@ -1478,7 +1343,7 @@ def admin_panel(request: Request):
                 const area = document.getElementById('charts-area');
                 const cfg  = SIGNAL_CONFIG[tipo] || {
                     label: tipo, color: '#7AAFC5', bg: 'rgba(122,175,197,0.1)',
-                    unit: '', emoji: '📶', yMin: null, yMax: null
+                    unit: '', emoji: '📶'
                 };
                 const señal = data[tipo];
 
@@ -1496,7 +1361,7 @@ def admin_panel(request: Request):
                 const vMin = Math.min(...señal.valores);
                 const vMax = Math.max(...señal.valores);
 
-                // ── Etiqueta especial para ECG: FC calculada ──
+                // ── ECG: FC calculada ──
                 let extraHtml = '';
                 if (tipo === 'ecg') {
                     const fc = calcularFC(señal.timestamps, señal.valores);
@@ -1508,25 +1373,25 @@ def admin_panel(request: Request):
                     }
                 }
 
-                // ── Etiqueta para frecuencia respiratoria ──
+                // ── Etiqueta flujo suavizado ──
                 if (tipo === 'frecuencia_respiratoria') {
                     const durSeg = señal.timestamps.length > 1
                         ? ((señal.timestamps[señal.timestamps.length-1] - señal.timestamps[0]) / 1000).toFixed(1)
                         : '--';
                     extraHtml = `<div style="margin-bottom:8px;font-size:11px;color:#5A7A8A;">
-                        Señal reconstruida desde flujo + Aceleración Z &nbsp;·&nbsp; Duración: ${durSeg}s
-                        &nbsp;·&nbsp; <span style="color:#4A9E6B;font-weight:bold;">Normalizada [-1, 1]</span>
+                        Señal de flujo interpolada y suavizada (doble media móvil) &nbsp;·&nbsp;
+                        Duración: ${durSeg}s &nbsp;·&nbsp;
+                        Rango: ${vMin.toFixed(0)} – ${vMax.toFixed(0)} ADC
                     </div>`;
                 }
 
-                // ── Stats box (ocultar para frec. resp porque están en [-1,1]) ──
-                const mostrarStats = tipo !== 'frecuencia_respiratoria';
-                const statsHtml = mostrarStats ? `
+                const mostrarStats = true;
+                const statsHtml = `
                     <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:4px;">
-                        ${statBox('Mínimo', vMin.toFixed(3), cfg.unit)}
-                        ${statBox('Máximo', vMax.toFixed(3), cfg.unit)}
-                        ${statBox('Promedio', (señal.valores.reduce((a,b)=>a+b,0)/señal.valores.length).toFixed(3), cfg.unit)}
-                    </div>` : '';
+                        ${statBox('Mínimo', vMin.toFixed(2), cfg.unit)}
+                        ${statBox('Máximo', vMax.toFixed(2), cfg.unit)}
+                        ${statBox('Promedio', (señal.valores.reduce((a,b)=>a+b,0)/señal.valores.length).toFixed(2), cfg.unit)}
+                    </div>`;
 
                 area.innerHTML = `
                     <div class="chart-card">
@@ -1538,30 +1403,27 @@ def admin_panel(request: Request):
 
                 const ctx = document.getElementById(canvasId).getContext('2d');
 
-                // ── Eje X: siempre en segundos relativos ──
+                // Eje X: segundos relativos
                 const t0 = señal.timestamps[0];
                 const labels = señal.timestamps.map(t => ((t - t0) / 1000).toFixed(2) + 's');
 
-                // ── Eje Y: fijo para ECG y frec. resp, automático para el resto ──
+                // ── CAMBIO PRINCIPAL: Eje Y dinámico según valores reales ──
                 let yScaleOpts;
                 if (tipo === 'ecg') {
+                    // ECG: dinámico → max+5, min-5 (refleja la señal real)
+                    const pad = 5;
                     yScaleOpts = {
-                        min: -35, max: 35,
+                        min: vMin - pad,
+                        max: vMax + pad,
                         ticks: { font: { size: 10 }, color: '#5A7A8A' },
                         grid: { color: '#EEF5FB' }
                     };
                 } else if (tipo === 'frecuencia_respiratoria') {
+                    // Flujo suavizado: auto-fit con 8% de margen
+                    const pad = Math.max((vMax - vMin) * 0.08, 2.0);
                     yScaleOpts = {
-                        min: -1.2, max: 1.2,
-                        ticks: {
-                            font: { size: 10 }, color: '#5A7A8A',
-                            callback: v => v === 0 ? '0 (apnea)' : v.toFixed(1)
-                        },
-                        grid: { color: '#EEF5FB' }
-                    };
-                } else if (cfg.yMin !== null && cfg.yMax !== null) {
-                    yScaleOpts = {
-                        min: cfg.yMin, max: cfg.yMax,
+                        min: vMin - pad,
+                        max: vMax + pad,
                         ticks: { font: { size: 10 }, color: '#5A7A8A' },
                         grid: { color: '#EEF5FB' }
                     };
@@ -1574,12 +1436,9 @@ def admin_panel(request: Request):
                     };
                 }
 
-                // ── Estilo de línea según señal ──
-                const esResp  = tipo === 'frecuencia_respiratoria';
-                const esEcg   = tipo === 'ecg';
-                const tension = esEcg ? 0 : (esResp ? 0.5 : 0.3);
-                const fill    = esResp ? { target: 'origin', above: cfg.bg, below: 'rgba(74,158,107,0.04)' }
-                              : (!esEcg);
+                const esResp = tipo === 'frecuencia_respiratoria';
+                const esEcg  = tipo === 'ecg';
+                const tension = esEcg ? 0 : (esResp ? 0.4 : 0.3);
 
                 chartInstances[tipo] = new Chart(ctx, {
                     type: 'line',
@@ -1590,10 +1449,10 @@ def admin_panel(request: Request):
                             data: señal.valores,
                             borderColor: cfg.color,
                             backgroundColor: cfg.bg,
-                            borderWidth: esEcg ? 1.2 : (esResp ? 2.0 : 1.6),
+                            borderWidth: esEcg ? 1.2 : (esResp ? 2.2 : 1.6),
                             pointRadius: señal.timestamps.length > 300 ? 0 : 2,
                             pointHoverRadius: 4,
-                            fill: fill,
+                            fill: !esEcg,
                             tension: tension,
                         }]
                     },
@@ -1604,19 +1463,9 @@ def admin_panel(request: Request):
                             legend: { display: false },
                             tooltip: {
                                 callbacks: {
-                                    label: ctx => {
-                                        const v = ctx.parsed.y.toFixed(3);
-                                        if (esResp) {
-                                            const estado = ctx.parsed.y > 0.1 ? '↑ insp'
-                                                         : ctx.parsed.y < -0.1 ? '↓ esp' : '— pausa';
-                                            return ` ${v}  ${estado}`;
-                                        }
-                                        return ` ${v} ${cfg.unit}`;
-                                    }
+                                    label: ctx => ` ${ctx.parsed.y.toFixed(2)} ${cfg.unit}`
                                 }
-                            },
-                            // Línea de referencia en 0 para ECG y resp
-                            annotation: undefined
+                            }
                         },
                         scales: {
                             x: {
