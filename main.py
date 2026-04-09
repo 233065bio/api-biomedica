@@ -528,20 +528,19 @@ def senales_completas(interrupcion_id: int):
                 ts, vs = _limpiar_outliers_ecg(ts, vs)
             resultado[tipo] = {"timestamps": ts, "valores": vs}
 
-        # Construir señal respiratoria desde SOLO flujo
+        # Construir señal respiratoria combinando flujo + acce_z
         ts_flujo = raw.get("flujo",  {}).get("timestamps", [])
         vs_flujo = raw.get("flujo",  {}).get("valores",    [])
         ts_accz  = raw.get("acce_z", {}).get("timestamps", [])
         vs_accz  = raw.get("acce_z", {}).get("valores",    [])
 
-        if ts_flujo or ts_accz:
-            ts_resp, vs_resp = _construir_resp_desde_streaming(
-                ts_flujo, vs_flujo, ts_accz, vs_accz
-            )
-            resultado["frecuencia_respiratoria"] = {
-                "timestamps": ts_resp,
-                "valores":    vs_resp
-            }
+        ts_resp, vs_resp = _construir_resp_desde_streaming(
+            ts_flujo, vs_flujo, ts_accz, vs_accz
+        )
+        resultado["frecuencia_respiratoria"] = {
+            "timestamps": ts_resp,
+            "valores":    vs_resp
+        }
 
         return resultado
     except Exception as e:
@@ -566,51 +565,31 @@ def _limpiar_outliers_ecg(timestamps, valores):
     return timestamps, valores_limpios
 
 
-def _interpolar_senal(timestamps, valores, n_puntos=200):
-    """Interpolación lineal base para señales de baja frecuencia."""
-    if len(timestamps) < 2:
-        return timestamps, valores
-    t_min = timestamps[0]
-    t_max = timestamps[-1]
-    if t_min == t_max:
-        return timestamps, valores
-    paso = (t_max - t_min) / (n_puntos - 1)
-    ts_nuevo = [int(t_min + i * paso) for i in range(n_puntos)]
-    vs_nuevo = []
-    j = 0
-    for t in ts_nuevo:
-        while j < len(timestamps) - 2 and timestamps[j + 1] < t:
-            j += 1
-        t0, t1 = timestamps[j], timestamps[min(j + 1, len(timestamps) - 1)]
-        v0, v1 = valores[j], valores[min(j + 1, len(valores) - 1)]
-        if t1 == t0:
-            vs_nuevo.append(v0)
-        else:
-            frac = (t - t0) / (t1 - t0)
-            vs_nuevo.append(v0 + frac * (v1 - v0))
-    return ts_nuevo, vs_nuevo
-
-
 import math as _math
 
 def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
     """
-    Construye la señal respiratoria usando SOLO la señal de flujo.
-    - Interpola a 500 puntos uniformes para curva continua.
-    - Aplica doble pasada de media móvil para eliminar picos de ruido.
-    - Devuelve valores ADC reales (sin normalizar) para visualización directa.
-
-    Si no hay datos de flujo, genera onda senoidal en rango ADC típico (120-190).
+    Construye la señal respiratoria combinando flujo (primario) y acce_z (secundario).
+    - Fusiona ambas señales en una línea de tiempo unificada
+    - Normaliza acce_z al rango ADC del flujo para que sean compatibles
+    - Aplica suavizado gaussiano fuerte (3 pasadas de media móvil) para onda continua
+    - Interpola a 500 puntos uniformes
+    - Si hay pocas muestras de flujo, usa acce_z como base o genera onda senoidal
     """
-    def media_movil(valores, ventana):
+
+    def media_movil_gauss(valores, ventana):
+        """Suavizado gaussiano aproximado con 3 pasadas de media móvil."""
         if len(valores) <= ventana:
-            return valores
-        resultado = []
-        for i in range(len(valores)):
-            inicio = max(0, i - ventana // 2)
-            fin    = min(len(valores), i + ventana // 2 + 1)
-            resultado.append(sum(valores[inicio:fin]) / (fin - inicio))
-        return resultado
+            return valores[:]
+        result = valores[:]
+        for _ in range(3):
+            nuevo = []
+            for i in range(len(result)):
+                inicio = max(0, i - ventana // 2)
+                fin = min(len(result), i + ventana // 2 + 1)
+                nuevo.append(sum(result[inicio:fin]) / (fin - inicio))
+            result = nuevo
+        return result
 
     def interpolar_uniforme(ts, vs, n=500):
         if len(ts) < 2:
@@ -625,30 +604,97 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
         for t in ts_n:
             while j < len(ts) - 2 and ts[j + 1] < t:
                 j += 1
-            t_a, t_b = ts[j], ts[min(j+1, len(ts)-1)]
-            v_a, v_b = vs[j], vs[min(j+1, len(vs)-1)]
+            t_a = ts[j]
+            t_b = ts[min(j + 1, len(ts) - 1)]
+            v_a = vs[j]
+            v_b = vs[min(j + 1, len(vs) - 1)]
             frac = (t - t_a) / (t_b - t_a) if t_b != t_a else 0.0
             vs_n.append(v_a + frac * (v_b - v_a))
         return ts_n, vs_n
 
-    # Usar SOLO flujo si hay suficientes muestras
-    if len(ts_flujo) > 2:
-        ts_u, vs_interp = interpolar_uniforme(ts_flujo, vs_flujo, 500)
-        # Primera pasada: ventana ~8% de los puntos
-        ventana1 = max(5, len(vs_interp) // 12)
-        vs_suave = media_movil(vs_interp, ventana1)
-        # Segunda pasada: ventana ~4% para afinar
-        ventana2 = max(3, ventana1 // 2)
-        vs_suave = media_movil(vs_suave, ventana2)
-        t0 = ts_u[0]
-        ts_rel = [t - t0 for t in ts_u]
-        return ts_rel, [round(v, 3) for v in vs_suave]
+    def normalizar_al_rango(valores, ref_min, ref_max):
+        """Escala valores al rango de referencia (ADC del flujo)."""
+        if not valores:
+            return valores
+        v_min = min(valores)
+        v_max = max(valores)
+        if v_max == v_min:
+            return [(ref_min + ref_max) / 2] * len(valores)
+        escala = (ref_max - ref_min) / (v_max - v_min)
+        return [ref_min + (v - v_min) * escala for v in valores]
 
-    # Fallback: onda senoidal en rango ADC típico si no hay flujo
+    def interp_en_ts(ts_src, vs_src, ts_dest):
+        """Interpola señal en timestamps destino con extrapolación en bordes."""
+        resultado = []
+        j = 0
+        for t in ts_dest:
+            if t <= ts_src[0]:
+                resultado.append(vs_src[0])
+                continue
+            if t >= ts_src[-1]:
+                resultado.append(vs_src[-1])
+                continue
+            while j < len(ts_src) - 2 and ts_src[j + 1] < t:
+                j += 1
+            t_a, t_b = ts_src[j], ts_src[min(j + 1, len(ts_src) - 1)]
+            v_a, v_b = vs_src[j], vs_src[min(j + 1, len(vs_src) - 1)]
+            frac = (t - t_a) / (t_b - t_a) if t_b != t_a else 0.0
+            resultado.append(v_a + frac * (v_b - v_a))
+        return resultado
+
+    tiene_flujo = len(ts_flujo) > 1
+    tiene_accz  = len(ts_accz) > 1
+
+    # ── Caso A: Solo flujo (suficientes muestras) ──
+    if tiene_flujo and not tiene_accz:
+        ts_u, vs_i = interpolar_uniforme(ts_flujo, vs_flujo, 500)
+        ventana = max(7, len(vs_i) // 10)
+        vs_s = media_movil_gauss(vs_i, ventana)
+        t0 = ts_u[0]
+        return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
+
+    # ── Caso B: Solo acce_z ──
+    if tiene_accz and not tiene_flujo:
+        ts_u, vs_i = interpolar_uniforme(ts_accz, vs_accz, 500)
+        ventana = max(7, len(vs_i) // 10)
+        vs_s = media_movil_gauss(vs_i, ventana)
+        t0 = ts_u[0]
+        return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
+
+    # ── Caso C: Ambas señales — fusionar flujo + acce_z ──
+    if tiene_flujo and tiene_accz:
+        t_global_min = min(ts_flujo[0], ts_accz[0])
+        t_global_max = max(ts_flujo[-1], ts_accz[-1])
+        duracion = t_global_max - t_global_min
+        if duracion <= 0:
+            duracion = 20000
+
+        N = 500
+        paso = duracion / (N - 1)
+        ts_u = [int(t_global_min + i * paso) for i in range(N)]
+
+        vs_flujo_i = interp_en_ts(ts_flujo, vs_flujo, ts_u)
+        vs_accz_i  = interp_en_ts(ts_accz,  vs_accz,  ts_u)
+
+        # Rango de referencia del flujo (ADC real)
+        f_min = min(vs_flujo_i)
+        f_max = max(vs_flujo_i)
+
+        # Normalizar acce_z al mismo rango ADC que flujo
+        vs_accz_norm = normalizar_al_rango(vs_accz_i, f_min, f_max)
+
+        # Combinar: flujo 70% + acce_z normalizado 30%
+        vs_comb = [0.70 * f + 0.30 * a for f, a in zip(vs_flujo_i, vs_accz_norm)]
+
+        # Suavizado gaussiano fuerte — ventana ~12.5% de los puntos
+        ventana = max(15, N // 8)
+        vs_s = media_movil_gauss(vs_comb, ventana)
+
+        t0 = ts_u[0]
+        return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
+
+    # ── Fallback: onda senoidal en rango ADC típico (125–185) ──
     duracion_ms = 20000
-    if ts_accz and len(ts_accz) > 1:
-        duracion_ms = ts_accz[-1] - ts_accz[0]
-    duracion_ms = max(duracion_ms, 1000)
     N = 500
     ts_out = [int(i * duracion_ms / (N - 1)) for i in range(N)]
     vs_out = [round(155 + 30 * _math.sin(2 * _math.pi * 0.25 * t / 1000.0), 3) for t in ts_out]
@@ -942,7 +988,6 @@ async def subir_datos(datos: DatosESP32):
 
 # ─────────────────────────────────────────────
 # PANEL ADMIN
-# Cambios: ECG eje Y dinámico, Flujo resp en ADC real
 # ─────────────────────────────────────────────
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel(request: Request):
@@ -1143,17 +1188,16 @@ def admin_panel(request: Request):
             let chartInstances = {};
             let senalesCache = {};
 
-            // ── CAMBIO: frecuencia_respiratoria ahora muestra ADC real (no normalizado) ──
             const SIGNAL_CONFIG = {
-                ecg:    { label: 'ECG',              color: '#E05C5C', bg: 'rgba(224,92,92,0.08)',   unit: 'mV',   emoji: '❤️'  },
-                spo2:   { label: 'SpO₂',             color: '#5C9AE0', bg: 'rgba(92,154,224,0.1)',   unit: '%',    emoji: '🩸'  },
-                acce_z: { label: 'Aceleración Z',    color: '#5CBE80', bg: 'rgba(92,190,128,0.1)',   unit: 'm/s²', emoji: '🔵'  },
-                flujo:  { label: 'Flujo resp.',      color: '#E0A55C', bg: 'rgba(224,165,92,0.1)',   unit: 'ADC',  emoji: '💨'  },
+                ecg:    { label: 'ECG',                          color: '#E05C5C', bg: 'rgba(224,92,92,0.08)',   unit: 'mV',   emoji: '❤️'  },
+                spo2:   { label: 'SpO₂',                         color: '#5C9AE0', bg: 'rgba(92,154,224,0.1)',   unit: '%',    emoji: '🩸'  },
+                acce_z: { label: 'Aceleración Z',                color: '#5CBE80', bg: 'rgba(92,190,128,0.1)',   unit: 'm/s²', emoji: '🔵'  },
+                flujo:  { label: 'Flujo resp.',                  color: '#E0A55C', bg: 'rgba(224,165,92,0.1)',   unit: 'ADC',  emoji: '💨'  },
                 frecuencia_respiratoria: {
-                    label: 'Flujo Resp. (suavizado)',
+                    label: 'Flujo Respiratorio',
                     color: '#4A9E6B',
                     bg: 'rgba(74,158,107,0.12)',
-                    unit: 'ADC',   // valores ADC reales del flujo
+                    unit: 'ADC',
                     emoji: '🌬️'
                 },
             };
@@ -1373,19 +1417,18 @@ def admin_panel(request: Request):
                     }
                 }
 
-                // ── Etiqueta flujo suavizado ──
+                // ── Info flujo respiratorio combinado ──
                 if (tipo === 'frecuencia_respiratoria') {
                     const durSeg = señal.timestamps.length > 1
                         ? ((señal.timestamps[señal.timestamps.length-1] - señal.timestamps[0]) / 1000).toFixed(1)
                         : '--';
                     extraHtml = `<div style="margin-bottom:8px;font-size:11px;color:#5A7A8A;">
-                        Señal de flujo interpolada y suavizada (doble media móvil) &nbsp;·&nbsp;
+                        Señal respiratoria combinada (flujo + aceleración Z, suavizado gaussiano) &nbsp;·&nbsp;
                         Duración: ${durSeg}s &nbsp;·&nbsp;
                         Rango: ${vMin.toFixed(0)} – ${vMax.toFixed(0)} ADC
                     </div>`;
                 }
 
-                const mostrarStats = true;
                 const statsHtml = `
                     <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:4px;">
                         ${statBox('Mínimo', vMin.toFixed(2), cfg.unit)}
@@ -1407,20 +1450,19 @@ def admin_panel(request: Request):
                 const t0 = señal.timestamps[0];
                 const labels = señal.timestamps.map(t => ((t - t0) / 1000).toFixed(2) + 's');
 
-                // ── CAMBIO PRINCIPAL: Eje Y dinámico según valores reales ──
+                const esResp = tipo === 'frecuencia_respiratoria';
+                const esEcg  = tipo === 'ecg';
+                const esAccz = tipo === 'acce_z';
+                const esFlujo = tipo === 'flujo';
+
+                // ── Tension: curvas suaves para resp y accz, duras para ecg ──
+                // tension 0 = líneas rectas, 0.5 = curvas tipo Bezier suaves
+                const tension = esEcg ? 0 : (esResp ? 0.5 : (esAccz ? 0.45 : (esFlujo ? 0.4 : 0.3)));
+
+                // ── Eje Y dinámico según valores reales ──
                 let yScaleOpts;
                 if (tipo === 'ecg') {
-                    // ECG: dinámico → max+5, min-5 (refleja la señal real)
-                    const pad = 5;
-                    yScaleOpts = {
-                        min: vMin - pad,
-                        max: vMax + pad,
-                        ticks: { font: { size: 10 }, color: '#5A7A8A' },
-                        grid: { color: '#EEF5FB' }
-                    };
-                } else if (tipo === 'frecuencia_respiratoria') {
-                    // Flujo suavizado: auto-fit con 8% de margen
-                    const pad = Math.max((vMax - vMin) * 0.08, 2.0);
+                    const pad = Math.max((vMax - vMin) * 0.1, 5);
                     yScaleOpts = {
                         min: vMin - pad,
                         max: vMax + pad,
@@ -1428,17 +1470,19 @@ def admin_panel(request: Request):
                         grid: { color: '#EEF5FB' }
                     };
                 } else {
-                    const pad = (vMax - vMin) * 0.1 || 0.5;
+                    // Auto-fit con 10% de margen para todas las demás señales
+                    const rango = vMax - vMin;
+                    const pad = Math.max(rango * 0.10, 1.0);
                     yScaleOpts = {
-                        min: vMin - pad, max: vMax + pad,
+                        min: vMin - pad,
+                        max: vMax + pad,
                         ticks: { font: { size: 10 }, color: '#5A7A8A' },
                         grid: { color: '#EEF5FB' }
                     };
                 }
 
-                const esResp = tipo === 'frecuencia_respiratoria';
-                const esEcg  = tipo === 'ecg';
-                const tension = esEcg ? 0 : (esResp ? 0.4 : 0.3);
+                // ── Puntos: ocultar cuando hay muchas muestras o en señales fluidas ──
+                const ocultarPuntos = señal.timestamps.length > 100 || esResp || esAccz || esFlujo;
 
                 chartInstances[tipo] = new Chart(ctx, {
                     type: 'line',
@@ -1449,16 +1493,17 @@ def admin_panel(request: Request):
                             data: señal.valores,
                             borderColor: cfg.color,
                             backgroundColor: cfg.bg,
-                            borderWidth: esEcg ? 1.2 : (esResp ? 2.2 : 1.6),
-                            pointRadius: señal.timestamps.length > 300 ? 0 : 2,
+                            borderWidth: esEcg ? 1.2 : (esResp ? 2.5 : (esAccz ? 1.8 : 1.6)),
+                            pointRadius: ocultarPuntos ? 0 : 2,
                             pointHoverRadius: 4,
                             fill: !esEcg,
                             tension: tension,
+                            cubicInterpolationMode: 'monotone',
                         }]
                     },
                     options: {
                         responsive: true,
-                        animation: { duration: 250 },
+                        animation: { duration: 300 },
                         plugins: {
                             legend: { display: false },
                             tooltip: {
