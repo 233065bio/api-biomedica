@@ -315,6 +315,31 @@ def sesion_por_nombre(nombre: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
+# ENDPOINT: SESIONES POR PACIENTE (para visor)
+# ─────────────────────────────────────────────
+@app.get("/sesiones/por-paciente/{paciente_id}")
+def sesiones_por_paciente(paciente_id: int):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT id, fecha FROM sesiones
+            WHERE paciente_id = %s
+            ORDER BY fecha DESC
+        """, (paciente_id,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        result = []
+        for r in rows:
+            r = dict(r)
+            r["fecha"] = str(r["fecha"]) if r.get("fecha") else None
+            result.append(r)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────
 # ENDPOINTS HORAS DE SESIÓN (para app de escritorio)
 # ─────────────────────────────────────────────
 @app.get("/horas-sesion/{sesion_id}")
@@ -373,6 +398,36 @@ def interrupciones_por_hora(hora_sesion_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─────────────────────────────────────────────
+# ENDPOINT: INTERRUPCIONES POR SESIÓN (para visor)
+# ─────────────────────────────────────────────
+@app.get("/interrupciones-sesion/{sesion_id}")
+def interrupciones_por_sesion(sesion_id: int):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT i.id, i.numero_interrupcion, i.hora_detectada,
+                   i.duracion_segundos, i.spo2, i.frecuencia_cardiaca,
+                   i.anotacion, hs.numero_hora,
+                   (SELECT COUNT(*) FROM senales_esp32 WHERE interrupcion_id = i.id) AS total_senales
+            FROM interrupciones i
+            JOIN horas_sesion hs ON i.hora_sesion_id = hs.id
+            WHERE hs.sesion_id = %s
+            ORDER BY i.id
+        """, (sesion_id,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        result = []
+        for r in rows:
+            r = dict(r)
+            r["hora_detectada"] = timedelta_a_str(r.get("hora_detectada"))
+            result.append(r)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.put("/interrupciones/{interrupcion_id}/anotacion")
 async def guardar_anotacion_endpoint(interrupcion_id: int, body: AnotacionModel):
     try:
@@ -390,7 +445,7 @@ async def guardar_anotacion_endpoint(interrupcion_id: int, body: AnotacionModel)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
-# ENDPOINTS SEÑALES (para app de escritorio)
+# ENDPOINTS SEÑALES (para app de escritorio y visor)
 # ─────────────────────────────────────────────
 @app.get("/senales/{interrupcion_id}/{tipo}")
 def senales_por_interrupcion(interrupcion_id: int, tipo: str):
@@ -407,6 +462,38 @@ def senales_por_interrupcion(interrupcion_id: int, tipo: str):
         cursor.close()
         conn.close()
         return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────
+# ENDPOINT: TODAS LAS SEÑALES DE UNA INTERRUPCIÓN
+# ─────────────────────────────────────────────
+@app.get("/senales-completas/{interrupcion_id}")
+def senales_completas(interrupcion_id: int):
+    """Devuelve todas las señales de una interrupción agrupadas por tipo."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT tipo_senal, timestamp_ms, valor
+            FROM senales_esp32
+            WHERE interrupcion_id = %s
+            ORDER BY tipo_senal, timestamp_ms
+        """, (interrupcion_id,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        # Agrupar por tipo de señal
+        resultado = {}
+        for r in rows:
+            tipo = r["tipo_senal"]
+            if tipo not in resultado:
+                resultado[tipo] = {"timestamps": [], "valores": []}
+            resultado[tipo]["timestamps"].append(r["timestamp_ms"])
+            resultado[tipo]["valores"].append(float(r["valor"]))
+
+        return resultado
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -437,7 +524,6 @@ def obtener_datos_sensores(request: Request):
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
-        # Serializar timedelta
         result = []
         for r in rows:
             r = dict(r)
@@ -468,7 +554,8 @@ async def crear_interrupcion(data: InterrupcionModel):
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO interrupciones (hora_sesion_id, numero_interrupcion, hora_detectada, duracion_segundos, spo2, frecuencia_cardiaca)
+            INSERT INTO interrupciones
+                (hora_sesion_id, numero_interrupcion, hora_detectada, duracion_segundos, spo2, frecuencia_cardiaca)
             VALUES (%s, %s, %s, %s, %s, %s)
         """, (data.hora_sesion_id, data.numero_interrupcion, data.hora_detectada, data.duracion_segundos, data.spo2, data.frecuencia_cardiaca))
         conn.commit()
@@ -490,7 +577,6 @@ def obtener_pacientes():
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
-    # Serializar fechas
     result = []
     for r in rows:
         r = dict(r)
@@ -682,6 +768,7 @@ def admin_panel(request: Request):
     <head>
         <meta charset="UTF-8">
         <title>AOS — Panel Admin</title>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
             body { font-family: Arial, sans-serif; background: #FFFFFF; color: #2C4A5A; }
@@ -699,6 +786,7 @@ def admin_panel(request: Request):
             .btn-primary { background: #7AAFC5; color: white; }
             .btn-danger { background: #D65C5C; color: white; font-size: 11px; padding: 5px 10px; }
             .btn-edit { background: #EEF5FB; color: #2C4A5A; font-size: 11px; padding: 5px 10px; border: 1px solid #D4E8F3; }
+            .btn-signal { background: #4A90B8; color: white; font-size: 11px; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; }
             table { width: 100%; border-collapse: collapse; }
             th { background: #EEF5FB; color: #2C4A5A; padding: 10px; text-align: left; font-size: 13px; border-bottom: 2px solid #D4E8F3; }
             td { padding: 10px; border-bottom: 1px solid #D4E8F3; font-size: 13px; }
@@ -712,8 +800,37 @@ def admin_panel(request: Request):
             .badge-ok { background: #EEF8F2; color: #2E7D52; }
             .badge-warn { background: #FFF8EC; color: #B07020; }
             .badge-crit { background: #FFF0EE; color: #A02020; }
-            .toast { position: fixed; bottom: 30px; right: 30px; background: #2C4A5A; color: white; padding: 12px 24px; border-radius: 6px; display: none; }
+            .toast { position: fixed; bottom: 30px; right: 30px; background: #2C4A5A; color: white; padding: 12px 24px; border-radius: 6px; display: none; z-index: 999; }
             .toast.show { display: block; }
+
+            /* ── Visor de Señales ── */
+            .visor-layout { display: grid; grid-template-columns: 300px 1fr; gap: 20px; }
+            .visor-panel { background: #EEF5FB; border-radius: 8px; border: 1px solid #D4E8F3; padding: 16px; }
+            .visor-panel h3 { font-size: 13px; color: #5A7A8A; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+            .visor-select { width: 100%; padding: 8px 10px; border: 1px solid #D4E8F3; border-radius: 4px; font-size: 13px; background: white; color: #2C4A5A; margin-bottom: 10px; }
+            .interr-list { max-height: 400px; overflow-y: auto; }
+            .interr-item { padding: 10px 12px; border-radius: 6px; cursor: pointer; margin-bottom: 6px; background: white; border: 1px solid #D4E8F3; transition: all 0.15s; }
+            .interr-item:hover { border-color: #7AAFC5; background: #F0F8FF; }
+            .interr-item.selected { border-color: #7AAFC5; background: #E3F2FA; }
+            .interr-item .interr-title { font-weight: bold; font-size: 13px; color: #2C4A5A; }
+            .interr-item .interr-meta { font-size: 11px; color: #5A7A8A; margin-top: 3px; }
+            .interr-item .interr-badge { font-size: 10px; padding: 2px 7px; border-radius: 10px; display: inline-block; margin-top: 4px; }
+            .charts-area { display: flex; flex-direction: column; gap: 16px; }
+            .chart-card { background: white; border: 1px solid #D4E8F3; border-radius: 8px; padding: 16px; }
+            .chart-card h4 { font-size: 12px; color: #5A7A8A; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }
+            .chart-card canvas { width: 100% !important; }
+            .no-signal { text-align: center; padding: 60px 20px; color: #5A7A8A; font-size: 13px; }
+            .signal-count { font-size: 11px; background: #D4E8F3; color: #2C4A5A; padding: 2px 8px; border-radius: 10px; }
+            .visor-info { background: white; border: 1px solid #D4E8F3; border-radius: 6px; padding: 12px; margin-bottom: 14px; font-size: 12px; color: #5A7A8A; }
+            .visor-info strong { color: #2C4A5A; }
+            .tabs-signal { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+            .tab-signal { padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: bold; cursor: pointer; border: 2px solid transparent; background: #EEF5FB; color: #5A7A8A; }
+            .tab-signal.active { color: white; }
+            .tab-signal[data-tipo="ecg"].active    { background: #E05C5C; border-color: #E05C5C; }
+            .tab-signal[data-tipo="spo2"].active   { background: #5C9AE0; border-color: #5C9AE0; }
+            .tab-signal[data-tipo="acce_z"].active { background: #5CBE80; border-color: #5CBE80; }
+            .tab-signal[data-tipo="flujo"].active  { background: #E0A55C; border-color: #E0A55C; }
+            .loading-msg { text-align:center; color:#7AAFC5; padding:40px; font-size:13px; }
         </style>
     </head>
     <body>
@@ -725,8 +842,11 @@ def admin_panel(request: Request):
             <div class="tab active" onclick="cambiarTab('pacientes', event)">👥 Pacientes</div>
             <div class="tab" onclick="cambiarTab('usuarios', event)">🔑 Usuarios</div>
             <div class="tab" onclick="cambiarTab('monitoreo', event)">📊 Monitoreo ESP32</div>
+            <div class="tab" onclick="cambiarTab('senales', event)">📈 Visor de Señales</div>
         </div>
         <div class="content">
+
+            <!-- ── PACIENTES ── -->
             <div id="sec-pacientes" class="section active">
                 <div class="toolbar">
                     <input class="search" id="buscar-pac" placeholder="🔍 Buscar paciente..." oninput="filtrarPacientes()">
@@ -740,6 +860,7 @@ def admin_panel(request: Request):
                 </table>
             </div>
 
+            <!-- ── USUARIOS ── -->
             <div id="sec-usuarios" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Gestión de usuarios</span>
@@ -751,6 +872,7 @@ def admin_panel(request: Request):
                 </table>
             </div>
 
+            <!-- ── MONITOREO ESP32 ── -->
             <div id="sec-monitoreo" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Registros históricos enviados por ESP32 (Solo lectura)</span>
@@ -763,8 +885,49 @@ def admin_panel(request: Request):
                     <tbody id="tbody-monitoreo"></tbody>
                 </table>
             </div>
-        </div>
 
+            <!-- ── VISOR DE SEÑALES ── -->
+            <div id="sec-senales" class="section">
+                <div class="visor-layout">
+
+                    <!-- Panel izquierdo: selección -->
+                    <div>
+                        <div class="visor-panel">
+                            <h3>📁 Navegación</h3>
+                            <label style="font-size:11px;color:#5A7A8A;font-weight:bold;">PACIENTE</label>
+                            <select class="visor-select" id="sel-paciente" onchange="onPacienteChange()">
+                                <option value="">— Seleccionar —</option>
+                            </select>
+                            <label style="font-size:11px;color:#5A7A8A;font-weight:bold;">SESIÓN</label>
+                            <select class="visor-select" id="sel-sesion" onchange="onSesionChange()" disabled>
+                                <option value="">— Seleccionar —</option>
+                            </select>
+
+                            <h3 style="margin-top:16px;">⚡ Apneas detectadas</h3>
+                            <div id="interr-list" class="interr-list">
+                                <p style="font-size:12px;color:#5A7A8A;text-align:center;padding:20px 0;">Selecciona un paciente y sesión</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Panel derecho: gráficas -->
+                    <div>
+                        <div id="charts-placeholder" class="no-signal">
+                            <div style="font-size:40px;margin-bottom:12px;">📈</div>
+                            <p>Selecciona una apnea de la lista para visualizar sus señales</p>
+                        </div>
+                        <div id="charts-container" style="display:none;">
+                            <div class="visor-info" id="interr-info"></div>
+                            <div class="tabs-signal" id="tabs-signal"></div>
+                            <div class="charts-area" id="charts-area"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div><!-- /content -->
+
+        <!-- ── MODAL PACIENTE ── -->
         <div class="modal-bg" id="modal-paciente">
             <div class="modal">
                 <h2 id="modal-pac-titulo">Paciente</h2>
@@ -789,6 +952,7 @@ def admin_panel(request: Request):
             </div>
         </div>
 
+        <!-- ── MODAL USUARIO ── -->
         <div class="modal-bg" id="modal-usuario">
             <div class="modal">
                 <h2>Nuevo Usuario</h2>
@@ -805,6 +969,16 @@ def admin_panel(request: Request):
 
         <script>
             let pacientes = [];
+            let chartInstances = {};  // Guardar instancias de Chart.js para destruirlas
+            let senalesCache = {};    // Cache de señales por interrupcion_id
+
+            // ── Colores por tipo de señal ──────────────────────────────────────────
+            const SIGNAL_CONFIG = {
+                ecg:    { label: 'ECG',             color: '#E05C5C', bg: 'rgba(224,92,92,0.1)',    unit: 'mV',   emoji: '❤️' },
+                spo2:   { label: 'SpO₂',            color: '#5C9AE0', bg: 'rgba(92,154,224,0.1)',   unit: '%',    emoji: '🩸' },
+                acce_z: { label: 'Aceleración Z',   color: '#5CBE80', bg: 'rgba(92,190,128,0.1)',   unit: 'm/s²', emoji: '🔵' },
+                flujo:  { label: 'Flujo resp.',     color: '#E0A55C', bg: 'rgba(224,165,92,0.1)',   unit: 'ADC',  emoji: '💨' },
+            };
 
             function mostrarToast(msg) {
                 const t = document.getElementById('toast');
@@ -818,10 +992,263 @@ def admin_panel(request: Request):
                 event.currentTarget.classList.add('active');
                 document.getElementById('sec-' + tab).classList.add('active');
                 if (tab === 'pacientes') cargarPacientes();
-                if (tab === 'usuarios') cargarUsuarios();
+                if (tab === 'usuarios')  cargarUsuarios();
                 if (tab === 'monitoreo') cargarMonitoreo();
+                if (tab === 'senales')   iniciarVisor();
             }
 
+            // ══════════════════════════════════════════════
+            // VISOR DE SEÑALES
+            // ══════════════════════════════════════════════
+            async function iniciarVisor() {
+                const res = await fetch('/pacientes');
+                const pacs = await res.json();
+                const sel = document.getElementById('sel-paciente');
+                sel.innerHTML = '<option value="">— Seleccionar —</option>';
+                pacs.forEach(p => {
+                    const opt = document.createElement('option');
+                    opt.value = p.id;
+                    opt.textContent = p.nombre;
+                    sel.appendChild(opt);
+                });
+            }
+
+            async function onPacienteChange() {
+                const pacId = document.getElementById('sel-paciente').value;
+                const selSes = document.getElementById('sel-sesion');
+                selSes.innerHTML = '<option value="">— Seleccionar —</option>';
+                selSes.disabled = true;
+                document.getElementById('interr-list').innerHTML =
+                    '<p style="font-size:12px;color:#5A7A8A;text-align:center;padding:20px 0;">Selecciona una sesión</p>';
+                resetCharts();
+                if (!pacId) return;
+
+                const res = await fetch('/sesiones/por-paciente/' + pacId);
+                const sesiones = await res.json();
+                sesiones.forEach(s => {
+                    const opt = document.createElement('option');
+                    opt.value = s.id;
+                    opt.textContent = 'Sesión #' + s.id + ' — ' + (s.fecha || '').substring(0, 16);
+                    selSes.appendChild(opt);
+                });
+                selSes.disabled = false;
+            }
+
+            async function onSesionChange() {
+                const sesId = document.getElementById('sel-sesion').value;
+                resetCharts();
+                if (!sesId) {
+                    document.getElementById('interr-list').innerHTML =
+                        '<p style="font-size:12px;color:#5A7A8A;text-align:center;padding:20px 0;">Selecciona una sesión</p>';
+                    return;
+                }
+                document.getElementById('interr-list').innerHTML =
+                    '<div class="loading-msg">Cargando apneas...</div>';
+
+                const res = await fetch('/interrupciones-sesion/' + sesId);
+                const interrupciones = await res.json();
+                renderInterrList(interrupciones);
+            }
+
+            function renderInterrList(interrupciones) {
+                const cont = document.getElementById('interr-list');
+                if (!interrupciones.length) {
+                    cont.innerHTML = '<p style="font-size:12px;color:#5A7A8A;text-align:center;padding:20px 0;">No hay apneas registradas en esta sesión</p>';
+                    return;
+                }
+                cont.innerHTML = interrupciones.map(i => {
+                    const spo2Class = i.spo2 < 90 ? 'badge-crit' : i.spo2 < 95 ? 'badge-warn' : 'badge-ok';
+                    const tieneSenales = i.total_senales > 0;
+                    return `
+                    <div class="interr-item" id="item-${i.id}" onclick="cargarSenales(${i.id}, this)">
+                        <div class="interr-title">Apnea #${i.numero_interrupcion} · Hora ${i.numero_hora}:00</div>
+                        <div class="interr-meta">
+                            🕐 ${i.hora_detectada || '--'} &nbsp;|&nbsp; ⏱️ ${i.duracion_segundos}s
+                        </div>
+                        <div style="margin-top:5px;">
+                            <span class="badge ${spo2Class}">SpO₂ ${i.spo2}%</span>
+                            &nbsp;
+                            ${tieneSenales
+                                ? `<span class="interr-badge signal-count">📶 ${i.total_senales} muestras</span>`
+                                : `<span class="interr-badge" style="background:#FFF0EE;color:#A02020;">Sin señales</span>`}
+                        </div>
+                    </div>`;
+                }).join('');
+            }
+
+            async function cargarSenales(interrupcionId, el) {
+                // Marcar como seleccionado
+                document.querySelectorAll('.interr-item').forEach(i => i.classList.remove('selected'));
+                el.classList.add('selected');
+
+                document.getElementById('charts-placeholder').style.display = 'none';
+                document.getElementById('charts-container').style.display = 'block';
+                document.getElementById('charts-area').innerHTML = '<div class="loading-msg">⏳ Cargando señales...</div>';
+
+                // Obtener metadatos de la interrupción desde el DOM
+                const titulo = el.querySelector('.interr-title').textContent;
+                const meta   = el.querySelector('.interr-meta').textContent;
+                document.getElementById('interr-info').innerHTML =
+                    '<strong>' + titulo + '</strong> &nbsp;·&nbsp; ' + meta;
+
+                // Usar cache si existe
+                let data = senalesCache[interrupcionId];
+                if (!data) {
+                    const res = await fetch('/senales-completas/' + interrupcionId);
+                    data = await res.json();
+                    senalesCache[interrupcionId] = data;
+                }
+
+                const tipos = Object.keys(data);
+                if (!tipos.length) {
+                    document.getElementById('charts-area').innerHTML =
+                        '<div class="no-signal" style="padding:40px;">⚠️ Esta apnea no tiene señales almacenadas.<br><small>Las señales se envían en el reinicio del ESP32.</small></div>';
+                    document.getElementById('tabs-signal').innerHTML = '';
+                    return;
+                }
+
+                // Renderizar tabs de señales
+                renderTabsSignal(tipos, data);
+            }
+
+            function renderTabsSignal(tipos, data) {
+                // Ordenar tipos: ECG primero
+                const orden = ['ecg', 'spo2', 'acce_z', 'flujo'];
+                const tiposOrdenados = orden.filter(t => tipos.includes(t))
+                    .concat(tipos.filter(t => !orden.includes(t)));
+
+                const tabsCont = document.getElementById('tabs-signal');
+                tabsCont.innerHTML = tiposOrdenados.map((tipo, idx) => {
+                    const cfg = SIGNAL_CONFIG[tipo] || { label: tipo, emoji: '📶' };
+                    const n = data[tipo] ? data[tipo].timestamps.length : 0;
+                    return `<span class="tab-signal ${idx===0?'active':''}" data-tipo="${tipo}"
+                        onclick="activarTabSignal('${tipo}', tiposOrdenados, data)">
+                        ${cfg.emoji} ${cfg.label} <span style="opacity:0.7;font-size:10px;">(${n})</span>
+                    </span>`;
+                }).join('');
+
+                // Guardar referencia en window para el onclick
+                window._signalData = data;
+                window._signalTipos = tiposOrdenados;
+
+                // Mostrar primera señal
+                mostrarChartTipo(tiposOrdenados[0], data);
+
+                // Reasignar eventos
+                document.querySelectorAll('.tab-signal').forEach(tab => {
+                    tab.onclick = () => {
+                        document.querySelectorAll('.tab-signal').forEach(t => t.classList.remove('active'));
+                        tab.classList.add('active');
+                        mostrarChartTipo(tab.dataset.tipo, window._signalData);
+                    };
+                });
+            }
+
+            function activarTabSignal(tipo, tipos, data) {
+                document.querySelectorAll('.tab-signal').forEach(t => {
+                    t.classList.toggle('active', t.dataset.tipo === tipo);
+                });
+                mostrarChartTipo(tipo, data);
+            }
+
+            function mostrarChartTipo(tipo, data) {
+                const area = document.getElementById('charts-area');
+                const cfg  = SIGNAL_CONFIG[tipo] || { label: tipo, color: '#7AAFC5', bg: 'rgba(122,175,197,0.1)', unit: '', emoji: '📶' };
+                const señal = data[tipo];
+
+                if (!señal || !señal.timestamps.length) {
+                    area.innerHTML = `<div class="no-signal">Sin datos para ${cfg.label}</div>`;
+                    return;
+                }
+
+                // Destruir chart anterior si existe
+                if (chartInstances[tipo]) {
+                    chartInstances[tipo].destroy();
+                    delete chartInstances[tipo];
+                }
+
+                const canvasId = 'chart-' + tipo;
+                area.innerHTML = `
+                    <div class="chart-card">
+                        <h4>${cfg.emoji} ${cfg.label} — ${señal.timestamps.length} muestras</h4>
+                        <canvas id="${canvasId}" height="180"></canvas>
+                    </div>
+                    <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:4px;">
+                        ${statBox('Mínimo', Math.min(...señal.valores).toFixed(2), cfg.unit)}
+                        ${statBox('Máximo', Math.max(...señal.valores).toFixed(2), cfg.unit)}
+                        ${statBox('Promedio', (señal.valores.reduce((a,b)=>a+b,0)/señal.valores.length).toFixed(2), cfg.unit)}
+                    </div>`;
+
+                const ctx = document.getElementById(canvasId).getContext('2d');
+                // Calcular paso de tiempo relativo en ms
+                const t0 = señal.timestamps[0];
+                const labels = señal.timestamps.map(t => ((t - t0) / 1000).toFixed(2) + 's');
+
+                chartInstances[tipo] = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: cfg.label + ' (' + cfg.unit + ')',
+                            data: señal.valores,
+                            borderColor: cfg.color,
+                            backgroundColor: cfg.bg,
+                            borderWidth: tipo === 'ecg' ? 1.2 : 1.8,
+                            pointRadius: señal.timestamps.length > 500 ? 0 : 2,
+                            pointHoverRadius: 4,
+                            fill: tipo !== 'ecg',
+                            tension: tipo === 'ecg' ? 0 : 0.3,
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        animation: { duration: 300 },
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: {
+                                callbacks: {
+                                    label: ctx => ` ${ctx.parsed.y.toFixed(3)} ${cfg.unit}`
+                                }
+                            }
+                        },
+                        scales: {
+                            x: {
+                                ticks: {
+                                    maxTicksLimit: 12,
+                                    font: { size: 10 },
+                                    color: '#5A7A8A'
+                                },
+                                grid: { color: '#EEF5FB' }
+                            },
+                            y: {
+                                ticks: { font: { size: 10 }, color: '#5A7A8A' },
+                                grid: { color: '#EEF5FB' }
+                            }
+                        }
+                    }
+                });
+            }
+
+            function statBox(label, val, unit) {
+                return `<div style="background:#EEF5FB;border:1px solid #D4E8F3;border-radius:6px;padding:10px;text-align:center;">
+                    <div style="font-size:10px;color:#5A7A8A;margin-bottom:4px;">${label}</div>
+                    <div style="font-size:16px;font-weight:bold;color:#2C4A5A;">${val}</div>
+                    <div style="font-size:10px;color:#5A7A8A;">${unit}</div>
+                </div>`;
+            }
+
+            function resetCharts() {
+                Object.values(chartInstances).forEach(c => c.destroy());
+                chartInstances = {};
+                document.getElementById('charts-placeholder').style.display = 'block';
+                document.getElementById('charts-container').style.display = 'none';
+                document.getElementById('tabs-signal').innerHTML = '';
+                document.getElementById('charts-area').innerHTML = '';
+            }
+
+            // ══════════════════════════════════════════════
+            // PACIENTES
+            // ══════════════════════════════════════════════
             async function cargarPacientes() {
                 const res = await fetch('/pacientes');
                 pacientes = await res.json();
@@ -878,6 +1305,7 @@ def admin_panel(request: Request):
 
             function abrirModalPaciente() {
                 document.getElementById('pac-id').value = '';
+                ['pac-nombre','pac-fecha','pac-edad','pac-imc','pac-epworth'].forEach(id => document.getElementById(id).value = '');
                 document.getElementById('modal-paciente').classList.add('show');
             }
             function abrirModalUsuario() { document.getElementById('modal-usuario').classList.add('show'); }
