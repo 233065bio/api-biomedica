@@ -569,16 +569,14 @@ import math as _math
 
 def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
     """
-    Construye la señal respiratoria combinando flujo (primario) y acce_z (secundario).
-    - Fusiona ambas señales en una línea de tiempo unificada
-    - Normaliza acce_z al rango ADC del flujo para que sean compatibles
-    - Aplica suavizado gaussiano fuerte (3 pasadas de media móvil) para onda continua
-    - Interpola a 500 puntos uniformes
-    - Si hay pocas muestras de flujo, usa acce_z como base o genera onda senoidal
+    Construye la señal respiratoria:
+    - Si hay flujo: usa flujo como base con suavizado gaussiano (sin reinterpolación forzada)
+    - Si solo acce_z: usa acce_z suavizado
+    - Si ambas: combina 70/30 en la timeline del flujo
+    - Fallback: senoidal
     """
 
     def media_movil_gauss(valores, ventana):
-        """Suavizado gaussiano aproximado con 3 pasadas de media móvil."""
         if len(valores) <= ventana:
             return valores[:]
         result = valores[:]
@@ -591,29 +589,7 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
             result = nuevo
         return result
 
-    def interpolar_uniforme(ts, vs, n=500):
-        if len(ts) < 2:
-            return ts[:], vs[:]
-        t0, t1 = ts[0], ts[-1]
-        if t0 == t1:
-            return ts[:], vs[:]
-        paso = (t1 - t0) / (n - 1)
-        ts_n = [int(t0 + i * paso) for i in range(n)]
-        vs_n = []
-        j = 0
-        for t in ts_n:
-            while j < len(ts) - 2 and ts[j + 1] < t:
-                j += 1
-            t_a = ts[j]
-            t_b = ts[min(j + 1, len(ts) - 1)]
-            v_a = vs[j]
-            v_b = vs[min(j + 1, len(vs) - 1)]
-            frac = (t - t_a) / (t_b - t_a) if t_b != t_a else 0.0
-            vs_n.append(v_a + frac * (v_b - v_a))
-        return ts_n, vs_n
-
     def normalizar_al_rango(valores, ref_min, ref_max):
-        """Escala valores al rango de referencia (ADC del flujo)."""
         if not valores:
             return valores
         v_min = min(valores)
@@ -624,7 +600,6 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
         return [ref_min + (v - v_min) * escala for v in valores]
 
     def interp_en_ts(ts_src, vs_src, ts_dest):
-        """Interpola señal en timestamps destino con extrapolación en bordes."""
         resultado = []
         j = 0
         for t in ts_dest:
@@ -645,55 +620,42 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
     tiene_flujo = len(ts_flujo) > 1
     tiene_accz  = len(ts_accz) > 1
 
-    # ── Caso A: Solo flujo (suficientes muestras) ──
+    # ── Caso A: Solo flujo — suavizar SIN reinterpolación forzada ──
     if tiene_flujo and not tiene_accz:
-        ts_u, vs_i = interpolar_uniforme(ts_flujo, vs_flujo, 500)
-        ventana = max(7, len(vs_i) // 10)
-        vs_s = media_movil_gauss(vs_i, ventana)
-        t0 = ts_u[0]
-        return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
+        n = len(vs_flujo)
+        ventana = max(5, n // 15)
+        vs_s = media_movil_gauss(vs_flujo, ventana)
+        t0 = ts_flujo[0]
+        return [t - t0 for t in ts_flujo], [round(v, 3) for v in vs_s]
 
     # ── Caso B: Solo acce_z ──
     if tiene_accz and not tiene_flujo:
-        ts_u, vs_i = interpolar_uniforme(ts_accz, vs_accz, 500)
-        ventana = max(7, len(vs_i) // 10)
-        vs_s = media_movil_gauss(vs_i, ventana)
-        t0 = ts_u[0]
-        return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
+        n = len(vs_accz)
+        ventana = max(5, n // 15)
+        vs_s = media_movil_gauss(vs_accz, ventana)
+        t0 = ts_accz[0]
+        return [t - t0 for t in ts_accz], [round(v, 3) for v in vs_s]
 
-    # ── Caso C: Ambas señales — fusionar flujo + acce_z ──
+    # ── Caso C: Ambas — combinar usando timestamps del flujo como base ──
     if tiene_flujo and tiene_accz:
-        t_global_min = min(ts_flujo[0], ts_accz[0])
-        t_global_max = max(ts_flujo[-1], ts_accz[-1])
-        duracion = t_global_max - t_global_min
-        if duracion <= 0:
-            duracion = 20000
+        # Interpolar acce_z al mismo eje de tiempo que flujo
+        vs_accz_i = interp_en_ts(ts_accz, vs_accz, ts_flujo)
 
-        N = 500
-        paso = duracion / (N - 1)
-        ts_u = [int(t_global_min + i * paso) for i in range(N)]
-
-        vs_flujo_i = interp_en_ts(ts_flujo, vs_flujo, ts_u)
-        vs_accz_i  = interp_en_ts(ts_accz,  vs_accz,  ts_u)
-
-        # Rango de referencia del flujo (ADC real)
-        f_min = min(vs_flujo_i)
-        f_max = max(vs_flujo_i)
-
-        # Normalizar acce_z al mismo rango ADC que flujo
+        f_min = min(vs_flujo)
+        f_max = max(vs_flujo)
         vs_accz_norm = normalizar_al_rango(vs_accz_i, f_min, f_max)
 
-        # Combinar: flujo 70% + acce_z normalizado 30%
-        vs_comb = [0.70 * f + 0.30 * a for f, a in zip(vs_flujo_i, vs_accz_norm)]
+        # Combinar 70% flujo + 30% acce_z normalizado
+        vs_comb = [0.70 * f + 0.30 * a for f, a in zip(vs_flujo, vs_accz_norm)]
 
-        # Suavizado gaussiano fuerte — ventana ~12.5% de los puntos
-        ventana = max(15, N // 8)
+        n = len(vs_comb)
+        ventana = max(5, n // 15)
         vs_s = media_movil_gauss(vs_comb, ventana)
 
-        t0 = ts_u[0]
-        return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
+        t0 = ts_flujo[0]
+        return [t - t0 for t in ts_flujo], [round(v, 3) for v in vs_s]
 
-    # ── Fallback: onda senoidal en rango ADC típico (125–185) ──
+    # ── Fallback: senoidal ──
     duracion_ms = 20000
     N = 500
     ts_out = [int(i * duracion_ms / (N - 1)) for i in range(N)]
