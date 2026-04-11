@@ -337,6 +337,78 @@ def sesiones_por_paciente(paciente_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
+# ELIMINAR SESIÓN (en cascada: horas → interrupciones → señales)
+# ─────────────────────────────────────────────
+@app.delete("/sesiones/{sesion_id}")
+def eliminar_sesion(sesion_id: int, request: Request):
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # 1. Obtener todas las horas de esta sesión
+        cursor.execute("SELECT id FROM horas_sesion WHERE sesion_id = %s", (sesion_id,))
+        horas = [r[0] for r in cursor.fetchall()]
+
+        for hora_id in horas:
+            # 2. Obtener interrupciones de cada hora
+            cursor.execute("SELECT id FROM interrupciones WHERE hora_sesion_id = %s", (hora_id,))
+            interrupciones = [r[0] for r in cursor.fetchall()]
+
+            # 3. Eliminar señales de cada interrupción
+            for interr_id in interrupciones:
+                cursor.execute("DELETE FROM senales_esp32 WHERE interrupcion_id = %s", (interr_id,))
+
+            # 4. Eliminar interrupciones de esta hora
+            cursor.execute("DELETE FROM interrupciones WHERE hora_sesion_id = %s", (hora_id,))
+
+        # 5. Eliminar horas de la sesión
+        cursor.execute("DELETE FROM horas_sesion WHERE sesion_id = %s", (sesion_id,))
+
+        # 6. Eliminar la sesión
+        cursor.execute("DELETE FROM sesiones WHERE id = %s", (sesion_id,))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"status": "success", "eliminado": "sesion", "id": sesion_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────
+# ELIMINAR HORA DE SESIÓN (en cascada: interrupciones → señales)
+# ─────────────────────────────────────────────
+@app.delete("/horas-sesion/{hora_sesion_id}")
+def eliminar_hora_sesion(hora_sesion_id: int, request: Request):
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # 1. Obtener interrupciones de esta hora
+        cursor.execute("SELECT id FROM interrupciones WHERE hora_sesion_id = %s", (hora_sesion_id,))
+        interrupciones = [r[0] for r in cursor.fetchall()]
+
+        # 2. Eliminar señales de cada interrupción
+        for interr_id in interrupciones:
+            cursor.execute("DELETE FROM senales_esp32 WHERE interrupcion_id = %s", (interr_id,))
+
+        # 3. Eliminar interrupciones
+        cursor.execute("DELETE FROM interrupciones WHERE hora_sesion_id = %s", (hora_sesion_id,))
+
+        # 4. Eliminar la hora
+        cursor.execute("DELETE FROM horas_sesion WHERE id = %s", (hora_sesion_id,))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"status": "success", "eliminado": "hora_sesion", "id": hora_sesion_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────
 # ENDPOINTS HORAS DE SESIÓN
 # ─────────────────────────────────────────────
 @app.get("/horas-sesion/{sesion_id}")
@@ -476,6 +548,23 @@ async def guardar_anotacion_endpoint(interrupcion_id: int, body: AnotacionModel)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
+# ELIMINAR INTERRUPCIÓN (señales en cascada)
+# ─────────────────────────────────────────────
+@app.delete("/interrupciones/{interrupcion_id}")
+def eliminar_interrupcion(interrupcion_id: int):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM senales_esp32 WHERE interrupcion_id = %s", (interrupcion_id,))
+        cursor.execute("DELETE FROM interrupciones WHERE id = %s", (interrupcion_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────
 # ENDPOINTS SEÑALES
 # ─────────────────────────────────────────────
 @app.get("/senales/{interrupcion_id}/{tipo}")
@@ -528,7 +617,6 @@ def senales_completas(interrupcion_id: int):
                 ts, vs = _limpiar_outliers_ecg(ts, vs)
             resultado[tipo] = {"timestamps": ts, "valores": vs}
 
-        # Construir señal respiratoria combinando flujo + acce_z
         ts_flujo = raw.get("flujo",  {}).get("timestamps", [])
         vs_flujo = raw.get("flujo",  {}).get("valores",    [])
         ts_accz  = raw.get("acce_z", {}).get("timestamps", [])
@@ -548,7 +636,6 @@ def senales_completas(interrupcion_id: int):
 
 
 def _limpiar_outliers_ecg(timestamps, valores):
-    """Clip outliers del ECG usando IQR x5, preservando longitud."""
     if len(valores) < 10:
         return timestamps, valores
     sorted_v = sorted(valores)
@@ -568,17 +655,7 @@ def _limpiar_outliers_ecg(timestamps, valores):
 import math as _math
 
 def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
-    """
-    Construye la señal respiratoria combinando flujo (primario) y acce_z (secundario).
-    - Fusiona ambas señales en una línea de tiempo unificada
-    - Normaliza acce_z al rango ADC del flujo para que sean compatibles
-    - Aplica suavizado gaussiano fuerte (3 pasadas de media móvil) para onda continua
-    - Interpola a 500 puntos uniformes
-    - Si hay pocas muestras de flujo, usa acce_z como base o genera onda senoidal
-    """
-
     def media_movil_gauss(valores, ventana):
-        """Suavizado gaussiano aproximado con 3 pasadas de media móvil."""
         if len(valores) <= ventana:
             return valores[:]
         result = valores[:]
@@ -613,7 +690,6 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
         return ts_n, vs_n
 
     def normalizar_al_rango(valores, ref_min, ref_max):
-        """Escala valores al rango de referencia (ADC del flujo)."""
         if not valores:
             return valores
         v_min = min(valores)
@@ -624,7 +700,6 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
         return [ref_min + (v - v_min) * escala for v in valores]
 
     def interp_en_ts(ts_src, vs_src, ts_dest):
-        """Interpola señal en timestamps destino con extrapolación en bordes."""
         resultado = []
         j = 0
         for t in ts_dest:
@@ -645,7 +720,6 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
     tiene_flujo = len(ts_flujo) > 1
     tiene_accz  = len(ts_accz) > 1
 
-    # ── Caso A: Solo flujo (suficientes muestras) ──
     if tiene_flujo and not tiene_accz:
         ts_u, vs_i = interpolar_uniforme(ts_flujo, vs_flujo, 500)
         ventana = max(7, len(vs_i) // 10)
@@ -653,7 +727,6 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
         t0 = ts_u[0]
         return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
 
-    # ── Caso B: Solo acce_z ──
     if tiene_accz and not tiene_flujo:
         ts_u, vs_i = interpolar_uniforme(ts_accz, vs_accz, 500)
         ventana = max(7, len(vs_i) // 10)
@@ -661,7 +734,6 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
         t0 = ts_u[0]
         return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
 
-    # ── Caso C: Ambas señales — fusionar flujo + acce_z ──
     if tiene_flujo and tiene_accz:
         t_global_min = min(ts_flujo[0], ts_accz[0])
         t_global_max = max(ts_flujo[-1], ts_accz[-1])
@@ -676,24 +748,18 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
         vs_flujo_i = interp_en_ts(ts_flujo, vs_flujo, ts_u)
         vs_accz_i  = interp_en_ts(ts_accz,  vs_accz,  ts_u)
 
-        # Rango de referencia del flujo (ADC real)
         f_min = min(vs_flujo_i)
         f_max = max(vs_flujo_i)
 
-        # Normalizar acce_z al mismo rango ADC que flujo
         vs_accz_norm = normalizar_al_rango(vs_accz_i, f_min, f_max)
-
-        # Combinar: flujo 70% + acce_z normalizado 30%
         vs_comb = [0.70 * f + 0.30 * a for f, a in zip(vs_flujo_i, vs_accz_norm)]
 
-        # Suavizado gaussiano fuerte — ventana ~12.5% de los puntos
         ventana = max(15, N // 8)
         vs_s = media_movil_gauss(vs_comb, ventana)
 
         t0 = ts_u[0]
         return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
 
-    # ── Fallback: onda senoidal en rango ADC típico (125–185) ──
     duracion_ms = 20000
     N = 500
     ts_out = [int(i * duracion_ms / (N - 1)) for i in range(N)]
@@ -819,31 +885,53 @@ def editar_paciente(paciente_id: int, data: PacienteModel, request: Request):
     conn.close()
     return {"status": "success"}
 
-@app.delete("/interrupciones/{interrupcion_id}")
-def eliminar_interrupcion(interrupcion_id: int):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM senales_esp32 WHERE interrupcion_id=%s", (interrupcion_id,))
-        cursor.execute("DELETE FROM interrupciones WHERE id=%s", (interrupcion_id,))
-        conn.commit()
-        cursor.close()
-        conn.close()
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+# ─────────────────────────────────────────────
+# ELIMINAR PACIENTE (en cascada: sesiones → horas → interrupciones → señales)
+# ─────────────────────────────────────────────
 @app.delete("/pacientes/{paciente_id}")
 def eliminar_paciente(paciente_id: int, request: Request):
     if not verificar_sesion(request):
         raise HTTPException(status_code=401, detail="No autorizado")
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM pacientes WHERE id=%s", (paciente_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    return {"status": "success"}
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # 1. Obtener todas las sesiones del paciente
+        cursor.execute("SELECT id FROM sesiones WHERE paciente_id = %s", (paciente_id,))
+        sesiones = [r[0] for r in cursor.fetchall()]
+
+        for sesion_id in sesiones:
+            # 2. Obtener horas de cada sesión
+            cursor.execute("SELECT id FROM horas_sesion WHERE sesion_id = %s", (sesion_id,))
+            horas = [r[0] for r in cursor.fetchall()]
+
+            for hora_id in horas:
+                # 3. Obtener interrupciones de cada hora
+                cursor.execute("SELECT id FROM interrupciones WHERE hora_sesion_id = %s", (hora_id,))
+                interrupciones = [r[0] for r in cursor.fetchall()]
+
+                # 4. Eliminar señales de cada interrupción
+                for interr_id in interrupciones:
+                    cursor.execute("DELETE FROM senales_esp32 WHERE interrupcion_id = %s", (interr_id,))
+
+                # 5. Eliminar interrupciones
+                cursor.execute("DELETE FROM interrupciones WHERE hora_sesion_id = %s", (hora_id,))
+
+            # 6. Eliminar horas
+            cursor.execute("DELETE FROM horas_sesion WHERE sesion_id = %s", (sesion_id,))
+
+        # 7. Eliminar sesiones
+        cursor.execute("DELETE FROM sesiones WHERE paciente_id = %s", (paciente_id,))
+
+        # 8. Eliminar el paciente
+        cursor.execute("DELETE FROM pacientes WHERE id = %s", (paciente_id,))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"status": "success", "eliminado": "paciente", "id": paciente_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
 # ENDPOINTS USUARIOS
@@ -1049,7 +1137,7 @@ def admin_panel(request: Request):
             .chart-card canvas { width: 100% !important; }
             .no-signal { text-align: center; padding: 60px 20px; color: #5A7A8A; font-size: 13px; }
             .signal-count { font-size: 11px; background: #D4E8F3; color: #2C4A5A; padding: 2px 8px; border-radius: 10px; }
-            .visor-info { background: white; border: 1px solid #D4E8F3; border-radius: 6px; padding: 12px; margin-bottom: 14px; font-size: 12px; color: #5A7A8A; }
+            .visor-info { background: white; border: 1px solid #D4E8F3; border-radius: 6px; padding: 12px; margin-bottom: 14px; font-size: 12px; color: #5A7A8A; display: flex; justify-content: space-between; align-items: center; }
             .visor-info strong { color: #2C4A5A; }
             .tabs-signal { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
             .tab-signal { padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: bold; cursor: pointer; border: 2px solid transparent; background: #EEF5FB; color: #5A7A8A; }
@@ -1061,6 +1149,16 @@ def admin_panel(request: Request):
             .tab-signal[data-tipo="flujo"].active  { background: #E0A55C; border-color: #E0A55C; }
             .loading-msg { text-align:center; color:#7AAFC5; padding:40px; font-size:13px; }
             .fc-badge { background: #EEF8F2; color: #2E7D52; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
+            /* Modal de confirmación de eliminación */
+            .modal-confirm { background: white; border-radius: 8px; padding: 28px; width: 400px; text-align: center; }
+            .modal-confirm h3 { color: #2C4A5A; margin-bottom: 10px; }
+            .modal-confirm p { color: #5A7A8A; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
+            .modal-confirm .btn-row { display: flex; gap: 10px; justify-content: center; }
+            /* Selector de sesión en visor con botón borrar */
+            .sel-row { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; }
+            .sel-row select { flex: 1; margin-bottom: 0; }
+            .btn-del-sm { background: #D65C5C; color: white; border: none; border-radius: 4px; padding: 7px 10px; cursor: pointer; font-size: 13px; flex-shrink: 0; }
+            .btn-del-sm:disabled { background: #ccc; cursor: not-allowed; }
         </style>
     </head>
     <body>
@@ -1075,6 +1173,7 @@ def admin_panel(request: Request):
             <div class="tab" onclick="cambiarTab('senales', event)">📈 Visor de Señales</div>
         </div>
         <div class="content">
+            <!-- ══ PACIENTES ══ -->
             <div id="sec-pacientes" class="section active">
                 <div class="toolbar">
                     <input class="search" id="buscar-pac" placeholder="🔍 Buscar paciente..." oninput="filtrarPacientes()">
@@ -1087,6 +1186,8 @@ def admin_panel(request: Request):
                     <tbody id="tbody-pacientes"></tbody>
                 </table>
             </div>
+
+            <!-- ══ USUARIOS ══ -->
             <div id="sec-usuarios" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Gestión de usuarios</span>
@@ -1097,6 +1198,8 @@ def admin_panel(request: Request):
                     <tbody id="tbody-usuarios"></tbody>
                 </table>
             </div>
+
+            <!-- ══ MONITOREO ══ -->
             <div id="sec-monitoreo" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Registros históricos enviados por ESP32</span>
@@ -1109,19 +1212,29 @@ def admin_panel(request: Request):
                     <tbody id="tbody-monitoreo"></tbody>
                 </table>
             </div>
+
+            <!-- ══ VISOR DE SEÑALES ══ -->
             <div id="sec-senales" class="section">
                 <div class="visor-layout">
                     <div>
                         <div class="visor-panel">
                             <h3>📁 Navegación</h3>
+
                             <label style="font-size:11px;color:#5A7A8A;font-weight:bold;">PACIENTE</label>
-                            <select class="visor-select" id="sel-paciente" onchange="onPacienteChange()">
-                                <option value="">— Seleccionar —</option>
-                            </select>
+                            <div class="sel-row">
+                                <select class="visor-select" id="sel-paciente" onchange="onPacienteChange()" style="margin-bottom:0;">
+                                    <option value="">— Seleccionar —</option>
+                                </select>
+                            </div>
+
                             <label style="font-size:11px;color:#5A7A8A;font-weight:bold;">SESIÓN</label>
-                            <select class="visor-select" id="sel-sesion" onchange="onSesionChange()" disabled>
-                                <option value="">— Seleccionar —</option>
-                            </select>
+                            <div class="sel-row">
+                                <select class="visor-select" id="sel-sesion" onchange="onSesionChange()" disabled style="margin-bottom:0;">
+                                    <option value="">— Seleccionar —</option>
+                                </select>
+                                <button class="btn-del-sm" id="btn-del-sesion" onclick="confirmarEliminarSesion()" disabled title="Eliminar sesión">🗑️</button>
+                            </div>
+
                             <h3 style="margin-top:16px;">⚡ Apneas detectadas</h3>
                             <div id="interr-list" class="interr-list">
                                 <p style="font-size:12px;color:#5A7A8A;text-align:center;padding:20px 0;">Selecciona un paciente y sesión</p>
@@ -1134,7 +1247,10 @@ def admin_panel(request: Request):
                             <p>Selecciona una apnea de la lista para visualizar sus señales</p>
                         </div>
                         <div id="charts-container" style="display:none;">
-                            <div class="visor-info" id="interr-info"></div>
+                            <div class="visor-info" id="interr-info">
+                                <span id="interr-info-text"></span>
+                                <button class="btn-del-sm" id="btn-del-apnea" onclick="confirmarEliminarApnea()" title="Eliminar apnea">🗑️ Eliminar apnea</button>
+                            </div>
                             <div class="tabs-signal" id="tabs-signal"></div>
                             <div class="charts-area" id="charts-area"></div>
                         </div>
@@ -1181,24 +1297,34 @@ def admin_panel(request: Request):
             </div>
         </div>
 
+        <!-- MODAL CONFIRMACIÓN ELIMINACIÓN -->
+        <div class="modal-bg" id="modal-confirm">
+            <div class="modal-confirm">
+                <h3 id="confirm-titulo">¿Eliminar?</h3>
+                <p id="confirm-texto"></p>
+                <div class="btn-row">
+                    <button class="btn" style="background:#EEE; color:#333;" onclick="cerrarModals()">Cancelar</button>
+                    <button class="btn btn-danger" id="confirm-btn-ok" onclick="">Sí, eliminar</button>
+                </div>
+            </div>
+        </div>
+
         <div class="toast" id="toast"></div>
 
         <script>
             let pacientes = [];
             let chartInstances = {};
             let senalesCache = {};
+            let apneaActivaId = null;   // id de la interrupción seleccionada
+            let sesionActivaId = null;  // id de la sesión seleccionada en el visor
 
             const SIGNAL_CONFIG = {
-                ecg:    { label: 'ECG',                          color: '#E05C5C', bg: 'rgba(224,92,92,0.08)',   unit: 'mV',   emoji: '❤️'  },
-                spo2:   { label: 'SpO₂',                         color: '#5C9AE0', bg: 'rgba(92,154,224,0.1)',   unit: '%',    emoji: '🩸'  },
-                acce_z: { label: 'Aceleración Z',                color: '#5CBE80', bg: 'rgba(92,190,128,0.1)',   unit: 'm/s²', emoji: '🔵'  },
-                flujo:  { label: 'Flujo resp.',                  color: '#E0A55C', bg: 'rgba(224,165,92,0.1)',   unit: 'ADC',  emoji: '💨'  },
+                ecg:    { label: 'ECG',                 color: '#E05C5C', bg: 'rgba(224,92,92,0.08)',   unit: 'mV',   emoji: '❤️'  },
+                spo2:   { label: 'SpO₂',                color: '#5C9AE0', bg: 'rgba(92,154,224,0.1)',   unit: '%',    emoji: '🩸'  },
+                acce_z: { label: 'Aceleración Z',       color: '#5CBE80', bg: 'rgba(92,190,128,0.1)',   unit: 'm/s²', emoji: '🔵'  },
+                flujo:  { label: 'Flujo resp.',         color: '#E0A55C', bg: 'rgba(224,165,92,0.1)',   unit: 'ADC',  emoji: '💨'  },
                 frecuencia_respiratoria: {
-                    label: 'Flujo Respiratorio',
-                    color: '#4A9E6B',
-                    bg: 'rgba(74,158,107,0.12)',
-                    unit: 'ADC',
-                    emoji: '🌬️'
+                    label: 'Flujo Respiratorio', color: '#4A9E6B', bg: 'rgba(74,158,107,0.12)', unit: 'ADC', emoji: '🌬️'
                 },
             };
 
@@ -1220,6 +1346,17 @@ def admin_panel(request: Request):
             }
 
             // ══════════════════════════════════════════════
+            // MODAL DE CONFIRMACIÓN GENÉRICO
+            // ══════════════════════════════════════════════
+            function abrirConfirm(titulo, texto, fnConfirmar) {
+                document.getElementById('confirm-titulo').textContent = titulo;
+                document.getElementById('confirm-texto').textContent  = texto;
+                const btn = document.getElementById('confirm-btn-ok');
+                btn.onclick = () => { cerrarModals(); fnConfirmar(); };
+                document.getElementById('modal-confirm').classList.add('show');
+            }
+
+            // ══════════════════════════════════════════════
             // VISOR DE SEÑALES
             // ══════════════════════════════════════════════
             async function iniciarVisor() {
@@ -1238,8 +1375,11 @@ def admin_panel(request: Request):
             async function onPacienteChange() {
                 const pacId = document.getElementById('sel-paciente').value;
                 const selSes = document.getElementById('sel-sesion');
+                const btnDelSes = document.getElementById('btn-del-sesion');
                 selSes.innerHTML = '<option value="">— Seleccionar —</option>';
                 selSes.disabled = true;
+                btnDelSes.disabled = true;
+                sesionActivaId = null;
                 document.getElementById('interr-list').innerHTML =
                     '<p style="font-size:12px;color:#5A7A8A;text-align:center;padding:20px 0;">Selecciona una sesión</p>';
                 resetCharts();
@@ -1257,6 +1397,9 @@ def admin_panel(request: Request):
 
             async function onSesionChange() {
                 const sesId = document.getElementById('sel-sesion').value;
+                const btnDelSes = document.getElementById('btn-del-sesion');
+                sesionActivaId = sesId ? parseInt(sesId) : null;
+                btnDelSes.disabled = !sesId;
                 resetCharts();
                 if (!sesId) {
                     document.getElementById('interr-list').innerHTML =
@@ -1269,9 +1412,7 @@ def admin_panel(request: Request):
                 const resHoras = await fetch('/horas-sesion/' + sesId);
                 const horas = await resHoras.json();
                 window._horaOrdenMap = {};
-                horas.forEach(h => {
-                    window._horaOrdenMap[h.numero_hora] = h.hora_orden;
-                });
+                horas.forEach(h => { window._horaOrdenMap[h.numero_hora] = h.hora_orden; });
 
                 const res = await fetch('/interrupciones-sesion/' + sesId);
                 const interrupciones = await res.json();
@@ -1309,13 +1450,14 @@ def admin_panel(request: Request):
             async function cargarSenales(interrupcionId, el) {
                 document.querySelectorAll('.interr-item').forEach(i => i.classList.remove('selected'));
                 el.classList.add('selected');
+                apneaActivaId = interrupcionId;
                 document.getElementById('charts-placeholder').style.display = 'none';
                 document.getElementById('charts-container').style.display = 'block';
                 document.getElementById('charts-area').innerHTML = '<div class="loading-msg">⏳ Cargando señales...</div>';
 
                 const titulo = el.querySelector('.interr-title').textContent;
                 const meta   = el.querySelector('.interr-meta').textContent;
-                document.getElementById('interr-info').innerHTML =
+                document.getElementById('interr-info-text').innerHTML =
                     '<strong>' + titulo + '</strong> &nbsp;·&nbsp; ' + meta;
 
                 let data = senalesCache[interrupcionId];
@@ -1333,6 +1475,54 @@ def admin_panel(request: Request):
                     return;
                 }
                 renderTabsSignal(tipos, data);
+            }
+
+            // ── Eliminar apnea (interrupción) ──────────────────────────────────────
+            function confirmarEliminarApnea() {
+                if (!apneaActivaId) return;
+                abrirConfirm(
+                    '🗑️ Eliminar apnea',
+                    'Se eliminarán la apnea y todas sus señales almacenadas. Esta acción no se puede deshacer.',
+                    async () => {
+                        const res = await fetch('/interrupciones/' + apneaActivaId, { method: 'DELETE' });
+                        if (res.ok) {
+                            mostrarToast('✅ Apnea eliminada');
+                            apneaActivaId = null;
+                            delete senalesCache[apneaActivaId];
+                            resetCharts();
+                            // Recargar lista de apneas
+                            const sesId = document.getElementById('sel-sesion').value;
+                            if (sesId) onSesionChange();
+                        } else {
+                            mostrarToast('❌ Error al eliminar apnea');
+                        }
+                    }
+                );
+            }
+
+            // ── Eliminar sesión completa ───────────────────────────────────────────
+            function confirmarEliminarSesion() {
+                if (!sesionActivaId) return;
+                const sesText = document.getElementById('sel-sesion').options[document.getElementById('sel-sesion').selectedIndex].text;
+                abrirConfirm(
+                    '🗑️ Eliminar sesión',
+                    `Se eliminarán "${sesText}" y todos sus datos: horas, apneas y señales. Esta acción no se puede deshacer.`,
+                    async () => {
+                        const res = await fetch('/sesiones/' + sesionActivaId, { method: 'DELETE' });
+                        if (res.ok) {
+                            mostrarToast('✅ Sesión eliminada');
+                            sesionActivaId = null;
+                            apneaActivaId  = null;
+                            senalesCache   = {};
+                            resetCharts();
+                            // Refrescar selector de sesiones
+                            const pacId = document.getElementById('sel-paciente').value;
+                            if (pacId) onPacienteChange();
+                        } else {
+                            mostrarToast('❌ Error al eliminar sesión');
+                        }
+                    }
+                );
             }
 
             function renderTabsSignal(tipos, data) {
@@ -1386,8 +1576,7 @@ def admin_panel(request: Request):
             function mostrarChartTipo(tipo, data) {
                 const area = document.getElementById('charts-area');
                 const cfg  = SIGNAL_CONFIG[tipo] || {
-                    label: tipo, color: '#7AAFC5', bg: 'rgba(122,175,197,0.1)',
-                    unit: '', emoji: '📶'
+                    label: tipo, color: '#7AAFC5', bg: 'rgba(122,175,197,0.1)', unit: '', emoji: '📶'
                 };
                 const señal = data[tipo];
 
@@ -1405,7 +1594,6 @@ def admin_panel(request: Request):
                 const vMin = Math.min(...señal.valores);
                 const vMax = Math.max(...señal.valores);
 
-                // ── ECG: FC calculada ──
                 let extraHtml = '';
                 if (tipo === 'ecg') {
                     const fc = calcularFC(señal.timestamps, señal.valores);
@@ -1416,16 +1604,13 @@ def admin_panel(request: Request):
                         </div>`;
                     }
                 }
-
-                // ── Info flujo respiratorio combinado ──
                 if (tipo === 'frecuencia_respiratoria') {
                     const durSeg = señal.timestamps.length > 1
                         ? ((señal.timestamps[señal.timestamps.length-1] - señal.timestamps[0]) / 1000).toFixed(1)
                         : '--';
                     extraHtml = `<div style="margin-bottom:8px;font-size:11px;color:#5A7A8A;">
                         Señal respiratoria combinada (flujo + aceleración Z, suavizado gaussiano) &nbsp;·&nbsp;
-                        Duración: ${durSeg}s &nbsp;·&nbsp;
-                        Rango: ${vMin.toFixed(0)} – ${vMax.toFixed(0)} ADC
+                        Duración: ${durSeg}s &nbsp;·&nbsp; Rango: ${vMin.toFixed(0)} – ${vMax.toFixed(0)} ADC
                     </div>`;
                 }
 
@@ -1445,43 +1630,27 @@ def admin_panel(request: Request):
                     ${statsHtml}`;
 
                 const ctx = document.getElementById(canvasId).getContext('2d');
-
-                // Eje X: segundos relativos
                 const t0 = señal.timestamps[0];
                 const labels = señal.timestamps.map(t => ((t - t0) / 1000).toFixed(2) + 's');
 
-                const esResp = tipo === 'frecuencia_respiratoria';
-                const esEcg  = tipo === 'ecg';
-                const esAccz = tipo === 'acce_z';
+                const esResp  = tipo === 'frecuencia_respiratoria';
+                const esEcg   = tipo === 'ecg';
+                const esAccz  = tipo === 'acce_z';
                 const esFlujo = tipo === 'flujo';
-
-                // ── Tension: curvas suaves para resp y accz, duras para ecg ──
-                // tension 0 = líneas rectas, 0.5 = curvas tipo Bezier suaves
                 const tension = esEcg ? 0 : (esResp ? 0.5 : (esAccz ? 0.45 : (esFlujo ? 0.4 : 0.3)));
 
-                // ── Eje Y dinámico según valores reales ──
                 let yScaleOpts;
                 if (tipo === 'ecg') {
                     const pad = Math.max((vMax - vMin) * 0.1, 5);
-                    yScaleOpts = {
-                        min: vMin - pad,
-                        max: vMax + pad,
-                        ticks: { font: { size: 10 }, color: '#5A7A8A' },
-                        grid: { color: '#EEF5FB' }
-                    };
+                    yScaleOpts = { min: vMin - pad, max: vMax + pad,
+                        ticks: { font: { size: 10 }, color: '#5A7A8A' }, grid: { color: '#EEF5FB' } };
                 } else {
-                    // Auto-fit con 10% de margen para todas las demás señales
                     const rango = vMax - vMin;
                     const pad = Math.max(rango * 0.10, 1.0);
-                    yScaleOpts = {
-                        min: vMin - pad,
-                        max: vMax + pad,
-                        ticks: { font: { size: 10 }, color: '#5A7A8A' },
-                        grid: { color: '#EEF5FB' }
-                    };
+                    yScaleOpts = { min: vMin - pad, max: vMax + pad,
+                        ticks: { font: { size: 10 }, color: '#5A7A8A' }, grid: { color: '#EEF5FB' } };
                 }
 
-                // ── Puntos: ocultar cuando hay muchas muestras o en señales fluidas ──
                 const ocultarPuntos = señal.timestamps.length > 100 || esResp || esAccz || esFlujo;
 
                 chartInstances[tipo] = new Chart(ctx, {
@@ -1506,11 +1675,7 @@ def admin_panel(request: Request):
                         animation: { duration: 300 },
                         plugins: {
                             legend: { display: false },
-                            tooltip: {
-                                callbacks: {
-                                    label: ctx => ` ${ctx.parsed.y.toFixed(2)} ${cfg.unit}`
-                                }
-                            }
+                            tooltip: { callbacks: { label: ctx => ` ${ctx.parsed.y.toFixed(2)} ${cfg.unit}` } }
                         },
                         scales: {
                             x: {
@@ -1539,6 +1704,7 @@ def admin_panel(request: Request):
                 document.getElementById('charts-container').style.display = 'none';
                 document.getElementById('tabs-signal').innerHTML = '';
                 document.getElementById('charts-area').innerHTML = '';
+                apneaActivaId = null;
             }
 
             // ══════════════════════════════════════════════
@@ -1562,7 +1728,7 @@ def admin_panel(request: Request):
                         <td><span class="badge ${p.epworth >= 10 ? 'badge-warn' : 'badge-ok'}">${p.epworth || '--'}</span></td>
                         <td>
                             <button class="btn btn-edit" onclick='editarPaciente(${JSON.stringify(p)})'>✏️</button>
-                            <button class="btn btn-danger" onclick="eliminarPaciente(${p.id})">🗑️</button>
+                            <button class="btn btn-danger" onclick="confirmarEliminarPaciente(${p.id}, '${p.nombre.replace(/'/g, "\\'")}')">🗑️</button>
                         </td>
                     </tr>
                 `).join('');
@@ -1594,8 +1760,39 @@ def admin_panel(request: Request):
                 const res = await fetch('/usuarios');
                 const data = await res.json();
                 document.getElementById('tbody-usuarios').innerHTML = data.map(u => `
-                    <tr><td>${u.id}</td><td>${u.usuario}</td><td><button class="btn btn-danger" onclick="eliminarUsuario(${u.id})">🗑️</button></td></tr>
+                    <tr>
+                        <td>${u.id}</td>
+                        <td>${u.usuario}</td>
+                        <td>
+                            <button class="btn btn-danger" onclick="confirmarEliminarUsuario(${u.id}, '${u.usuario}')">🗑️</button>
+                        </td>
+                    </tr>
                 `).join('');
+            }
+
+            // ── Confirmaciones de eliminación ──────────────────────────────────────
+            function confirmarEliminarPaciente(id, nombre) {
+                abrirConfirm(
+                    '🗑️ Eliminar paciente',
+                    `Se eliminarán todos los datos de "${nombre}": sesiones, horas, apneas y señales. Esta acción no se puede deshacer.`,
+                    async () => {
+                        const res = await fetch('/pacientes/' + id, { method: 'DELETE' });
+                        if (res.ok) { mostrarToast('✅ Paciente eliminado'); cargarPacientes(); }
+                        else mostrarToast('❌ Error al eliminar paciente');
+                    }
+                );
+            }
+
+            function confirmarEliminarUsuario(id, nombre) {
+                abrirConfirm(
+                    '🗑️ Eliminar usuario',
+                    `¿Eliminar al usuario "${nombre}"?`,
+                    async () => {
+                        const res = await fetch('/usuarios/' + id, { method: 'DELETE' });
+                        if (res.ok) { mostrarToast('✅ Usuario eliminado'); cargarUsuarios(); }
+                        else mostrarToast('❌ Error al eliminar usuario');
+                    }
+                );
             }
 
             function abrirModalPaciente() {
@@ -1637,18 +1834,6 @@ def admin_panel(request: Request):
                 cerrarModals(); cargarPacientes(); mostrarToast('✅ Guardado');
             }
 
-            async function eliminarPaciente(id) {
-                if (confirm('¿Eliminar paciente?')) {
-                    await fetch('/pacientes/' + id, { method: 'DELETE' });
-                    cargarPacientes();
-                }
-            }
-            async function eliminarUsuario(id) {
-                if (confirm('¿Eliminar usuario?')) {
-                    await fetch('/usuarios/' + id, { method: 'DELETE' });
-                    cargarUsuarios();
-                }
-            }
             async function guardarUsuario() {
                 await fetch('/usuarios', {
                     method: 'POST',
