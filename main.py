@@ -723,14 +723,12 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
     if tiene_flujo and not tiene_accz:
         ts_u, vs_i = interpolar_uniforme(ts_flujo, vs_flujo, 500)
         ventana = max(7, len(vs_i) // 10)
-        vs_s = media_movil_gauss(vs_i, ventana)
         t0 = ts_u[0]
         return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
 
     if tiene_accz and not tiene_flujo:
         ts_u, vs_i = interpolar_uniforme(ts_accz, vs_accz, 500)
         ventana = max(7, len(vs_i) // 10)
-        vs_s = media_movil_gauss(vs_i, ventana)
         t0 = ts_u[0]
         return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
 
@@ -755,7 +753,6 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
         vs_comb = [0.70 * f + 0.30 * a for f, a in zip(vs_flujo_i, vs_accz_norm)]
 
         ventana = max(15, N // 8)
-        vs_s = media_movil_gauss(vs_comb, ventana)
 
         t0 = ts_u[0]
         return [t - t0 for t in ts_u], [round(v, 3) for v in vs_s]
