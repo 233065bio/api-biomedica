@@ -1459,9 +1459,18 @@ def admin_panel(request: Request):
 
                 let data = senalesCache[interrupcionId];
                 if (!data) {
-                    const res = await fetch('/senales-completas/' + interrupcionId);
-                    data = await res.json();
-                    senalesCache[interrupcionId] = data;
+                    try {
+                        const res = await fetch('/senales-completas/' + interrupcionId);
+                        if (!res.ok) throw new Error('HTTP ' + res.status);
+                        data = await res.json();
+                        senalesCache[interrupcionId] = data;
+                    } catch (err) {
+                        document.getElementById('charts-area').innerHTML =
+                            `<div class="no-signal" style="padding:40px;">❌ Error al cargar señales: ${err.message}<br><br>
+                            <button class="btn btn-primary" onclick="cargarSenales(${interrupcionId}, document.querySelector('.interr-item.selected'))">🔄 Reintentar</button>
+                            </div>`;
+                        return;
+                    }
                 }
 
                 const tipos = Object.keys(data);
