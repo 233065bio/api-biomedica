@@ -1555,32 +1555,120 @@ def admin_panel(request: Request):
             }
 
             function calcularFC(timestamps, valores) {
-                if (timestamps.length < 10) return null;
-                const t0 = timestamps[0];
-                const duracionTotal = (timestamps[timestamps.length - 1] - t0) / 1000.0;
+                if (timestamps.length < 20) return null;
+                const duracionTotal = (timestamps[timestamps.length - 1] - timestamps[0]) / 1000.0;
                 if (duracionTotal <= 0) return null;
-                const maxVal = Math.max(...valores);
-                const umbral = maxVal * 0.7;
-                if (umbral <= 0) return null;
-                let picos = 0, enPico = false;
-                for (let i = 1; i < valores.length - 1; i++) {
-                    if (valores[i] > umbral) {
-                        if (!enPico && valores[i] >= valores[i-1] && valores[i] >= valores[i+1]) {
-                            picos++; enPico = true;
-                        }
-                    } else { enPico = false; }
+            
+                // Frecuencia de muestreo estimada
+                const fs = timestamps.length / duracionTotal;
+            
+                // 1. Diferenciación (resalta pendientes de pico R)
+                const diff = [];
+                for (let i = 1; i < valores.length; i++) {
+                    diff.push(valores[i] - valores[i - 1]);
                 }
+            
+                // 2. Elevar al cuadrado (amplifica y positiviza)
+                const sq = diff.map(v => v * v);
+            
+                // 3. Ventana de integración (150ms aprox)
+                const winSamples = Math.max(3, Math.round(fs * 0.15));
+                const integrated = [];
+                for (let i = 0; i < sq.length; i++) {
+                    let sum = 0, count = 0;
+                    for (let j = Math.max(0, i - winSamples); j <= i; j++) {
+                        sum += sq[j]; count++;
+                    }
+                    integrated.push(sum / count);
+                }
+            
+                // 4. Umbral adaptativo basado en la media
+                const media = integrated.reduce((a, b) => a + b, 0) / integrated.length;
+                const umbral = media * 0.5;
+            
+                // 5. Detectar picos con periodo refractario (200ms mínimo entre picos)
+                const refractario = Math.round(fs * 0.2);
+                let picos = 0;
+                let ultimoPico = -refractario;
+                let enPico = false;
+            
+                for (let i = 1; i < integrated.length - 1; i++) {
+                    if (integrated[i] > umbral) {
+                        if (!enPico && (i - ultimoPico) >= refractario &&
+                            integrated[i] >= integrated[i - 1] && integrated[i] >= integrated[i + 1]) {
+                            picos++;
+                            ultimoPico = i;
+                            enPico = true;
+                        }
+                    } else {
+                        enPico = false;
+                    }
+                }
+            
                 if (picos < 2) return null;
                 const fc = Math.round((picos / duracionTotal) * 60);
-                return (fc >= 30 && fc <= 250) ? fc : null;
+                return (fc >= 30 && fc <= 220) ? fc : null;
             }
-
+            function detectarYFiltrarRuido(timestamps, valores) {
+                if (timestamps.length < 50) return { valores, filtrado: false };
+            
+                const duracion = (timestamps[timestamps.length - 1] - timestamps[0]) / 1000.0;
+                const fs = timestamps.length / duracion;
+            
+                // Detección de energía en banda 55-65 Hz mediante correlación con sinusoide 60Hz
+                const energia60 = (() => {
+                    let sumSin = 0, sumCos = 0, sumTotal = 0;
+                    const f0 = 60;
+                    for (let i = 0; i < valores.length; i++) {
+                        const t = (timestamps[i] - timestamps[0]) / 1000.0;
+                        const v = valores[i];
+                        sumSin += v * Math.sin(2 * Math.PI * f0 * t);
+                        sumCos += v * Math.cos(2 * Math.PI * f0 * t);
+                        sumTotal += v * v;
+                    }
+                    const pot60 = (sumSin * sumSin + sumCos * sumCos) / (valores.length * valores.length);
+                    const potTotal = sumTotal / valores.length;
+                    return potTotal > 0 ? pot60 / potTotal : 0;
+                })();
+            
+                // Si la energía en 60 Hz es mayor al 20% de la energía total → hay ruido
+                if (energia60 < 0.20) return { valores, filtrado: false };
+            
+                // Filtro notch IIR para 60 Hz
+                const r = 0.95;
+                const omega = 2 * Math.PI * 60 / fs;
+                const cosOmega = Math.cos(omega);
+                const b0 = 1, b1 = -2 * cosOmega, b2 = 1;
+                const a1 = -2 * r * cosOmega, a2 = r * r;
+            
+                const filtrado = new Array(valores.length).fill(0);
+                for (let i = 0; i < valores.length; i++) {
+                    const x0 = valores[i];
+                    const x1 = i >= 1 ? valores[i - 1] : 0;
+                    const x2 = i >= 2 ? valores[i - 2] : 0;
+                    const y1 = i >= 1 ? filtrado[i - 1] : 0;
+                    const y2 = i >= 2 ? filtrado[i - 2] : 0;
+                    filtrado[i] = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+                }
+            
+                return { valores: filtrado, filtrado: true };
+            }
             function mostrarChartTipo(tipo, data) {
                 const area = document.getElementById('charts-area');
                 const cfg  = SIGNAL_CONFIG[tipo] || {
                     label: tipo, color: '#7AAFC5', bg: 'rgba(122,175,197,0.1)', unit: '', emoji: '📶'
                 };
                 const señal = data[tipo];
+                // --- INICIO MODIFICACIÓN ---
+                let valoresGrafica = señal.valores;
+                let filtroAplicado = false;
+                
+                if (tipo === 'ecg' && señal.timestamps.length > 0) {
+                    const resultado = detectarYFiltrarRuido(señal.timestamps, señal.valores);
+                    valoresGrafica = resultado.valores;
+                    filtroAplicado = resultado.filtrado;
+                }
+                // --- FIN MODIFICACIÓN ---
 
                 if (!señal || !señal.timestamps.length) {
                     area.innerHTML = `<div class="no-signal">Sin datos para ${cfg.label}</div>`;
@@ -1597,14 +1685,6 @@ def admin_panel(request: Request):
                 const vMax = Math.max(...señal.valores);
 
                 let extraHtml = '';
-                if (tipo === 'ecg') {
-                    const fc = calcularFC(señal.timestamps, señal.valores);
-                    if (fc) {
-                        extraHtml = `<div style="margin-bottom:10px;">
-                            <span style="font-size:12px;color:#5A7A8A;">Frecuencia cardiaca estimada: </span>
-                            <span class="fc-badge">❤️ ${fc} lpm</span>
-                        </div>`;
-                    }
                 }
                 if (tipo === 'frecuencia_respiratoria') {
                     const durSeg = señal.timestamps.length > 1
@@ -1613,6 +1693,17 @@ def admin_panel(request: Request):
                     extraHtml = `<div style="margin-bottom:8px;font-size:11px;color:#5A7A8A;">
                         Señal respiratoria combinada (flujo + aceleración Z, suavizado gaussiano) &nbsp;·&nbsp;
                         Duración: ${durSeg}s &nbsp;·&nbsp; Rango: ${vMin.toFixed(0)} – ${vMax.toFixed(0)} ADC
+                    </div>`;
+                }
+                if (tipo === 'ecg') {
+                    const fc = calcularFC(señal.timestamps, valoresGrafica); // ← usa valoresGrafica
+                    let fcHtml = fc ? `<span class="fc-badge">❤️ ${fc} lpm</span>` : '';
+                    let filtroHtml = filtroAplicado
+                        ? `<span style="font-size:11px;background:#FFF8EC;color:#B07020;padding:2px 8px;border-radius:10px;margin-left:8px;">⚡ Filtro 60Hz activo</span>`
+                        : '';
+                    extraHtml = `<div style="margin-bottom:10px;">
+                        <span style="font-size:12px;color:#5A7A8A;">Frecuencia cardiaca estimada: </span>
+                        ${fcHtml}${filtroHtml}
                     </div>`;
                 }
 
