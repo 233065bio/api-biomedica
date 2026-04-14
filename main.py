@@ -1685,7 +1685,6 @@ def admin_panel(request: Request):
                 const vMax = Math.max(...señal.valores);
 
                 let extraHtml = '';
-                }
                 if (tipo === 'frecuencia_respiratoria') {
                     const durSeg = señal.timestamps.length > 1
                         ? ((señal.timestamps[señal.timestamps.length-1] - señal.timestamps[0]) / 1000).toFixed(1)
@@ -1752,7 +1751,7 @@ def admin_panel(request: Request):
                         labels: labels,
                         datasets: [{
                             label: cfg.label,
-                            data: señal.valores,
+                            data: valoresGraficas,
                             borderColor: cfg.color,
                             backgroundColor: cfg.bg,
                             borderWidth: esEcg ? 1.2 : (esResp ? 2.5 : (esAccz ? 1.8 : 1.6)),
