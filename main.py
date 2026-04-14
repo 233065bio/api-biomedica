@@ -1690,7 +1690,7 @@ def admin_panel(request: Request):
                         ? ((señal.timestamps[señal.timestamps.length-1] - señal.timestamps[0]) / 1000).toFixed(1)
                         : '--';
                     extraHtml = `<div style="margin-bottom:8px;font-size:11px;color:#5A7A8A;">
-                        Señal respiratoria combinada (flujo + aceleración Z, suavizado gaussiano) &nbsp;·&nbsp;
+                        Señal respiratoria combinada (flujo + aceleración Z) &nbsp;·&nbsp;
                         Duración: ${durSeg}s &nbsp;·&nbsp; Rango: ${vMin.toFixed(0)} – ${vMax.toFixed(0)} ADC
                     </div>`;
                 }
