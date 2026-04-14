@@ -1751,7 +1751,7 @@ def admin_panel(request: Request):
                         labels: labels,
                         datasets: [{
                             label: cfg.label,
-                            data: valoresGraficas,
+                            data: valoresGrafica,
                             borderColor: cfg.color,
                             backgroundColor: cfg.bg,
                             borderWidth: esEcg ? 1.2 : (esResp ? 2.5 : (esAccz ? 1.8 : 1.6)),
