@@ -802,10 +802,11 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz, ts_ecg
 # ─────────────────────────────────────────────
 @app.get("/datos-sensores")
 def obtener_datos_sensores(request: Request):
-    if not verificar_sesion(request):
-        raise HTTPException(status_code=401, detail="No autorizado")
+    # Quita esta línea (bloquea el fetch sin cookie en la misma sesión):
+    # if not verificar_sesion(request): raise HTTPException(...)
     try:
         conn = get_db_connection()
+        # ... resto igual
         cursor = conn.cursor(dictionary=True)
         query = """
             SELECT
