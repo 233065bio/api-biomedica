@@ -753,11 +753,11 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
         t0 = ts_u[0]
         return [t - t0 for t in ts_u], [round(v, 3) for v in vs_comb]
 
-    duracion_ms = 20000
-    N = 500
-    ts_out = [int(i * duracion_ms / (N - 1)) for i in range(N)]
-    vs_out = [round(155 + 30 * _math.sin(2 * _math.pi * 0.25 * t / 1000.0), 3) for t in ts_out]
-    return ts_out, vs_out
+        duracion_ms = 20000  # 20 segundos por defecto
+        N = 500
+        ts_out = [int(i * duracion_ms / (N - 1)) for i in range(N)]
+        vs_out = [round(155 + 30 * _math.sin(2 * _math.pi * 0.25 * t / 1000.0), 3) for t in ts_out]
+        return ts_out, vs_out
 
 
 # ─────────────────────────────────────────────
