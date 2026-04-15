@@ -650,8 +650,9 @@ def _limpiar_outliers_ecg(timestamps, valores):
     if iqr == 0:
         return timestamps, valores
     mediana = sorted_v[n // 2]
-    lim_inf = mediana - 5 * iqr
-    lim_sup = mediana + 5 * iqr
+    # ← Cambiar de 5 a 8 IQR: menos agresivo, preserva picos R
+    lim_inf = mediana - 8 * iqr
+    lim_sup = mediana + 8 * iqr
     valores_limpios = [max(lim_inf, min(lim_sup, v)) for v in valores]
     return timestamps, valores_limpios
 
@@ -1668,7 +1669,7 @@ def admin_panel(request: Request):
                 })();
             
                 // Si la energía en 60 Hz es mayor al 20% de la energía total → hay ruido
-                if (energia60 < 0.20) return { valores, filtrado: false };
+                if (energia60 < 0.35) return { valores, filtrado: false };
             
                 // Filtro notch IIR para 60 Hz
                 const r = 0.95;
@@ -1765,13 +1766,13 @@ def admin_panel(request: Request):
                 const esEcg   = tipo === 'ecg';
                 const esAccz  = tipo === 'acce_z';
                 const esFlujo = tipo === 'flujo';
-                const tension = esEcg ? 0 : (esResp ? 0.5 : (esAccz ? 0.45 : (esFlujo ? 0.4 : 0.3)));
+                const tension = esEcg ? 0.15 : (esResp ? 0.5 : (esAccz ? 0.45 : (esFlujo ? 0.4 : 0.3)));
 
                 let yScaleOpts;
                 if (tipo === 'ecg') {
                     const pad = Math.max((vMax - vMin) * 0.1, 5);
                     yScaleOpts = { min: vMin - pad, max: vMax + pad,
-                        ticks: { font: { size: 10 }, color: '#5A7A8A' }, grid: { color: '#EEF5FB' } };
+                        ticks: { font: { size: 10 }, color: '#5A7A8A', maxTicksLimit: 6, callback: (v) => v.toFixed(0)
                 } else {
                     const rango = vMax - vMin;
                     const pad = Math.max(rango * 0.10, 1.0);
