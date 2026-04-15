@@ -586,7 +586,6 @@ def senales_por_interrupcion(interrupcion_id: int, tipo: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/senales-completas/{interrupcion_id}")
-@app.get("/senales-completas/{interrupcion_id}")
 def senales_completas(interrupcion_id: int):
     """Devuelve todas las señales agrupadas por tipo, con limpieza de outliers."""
     try:
@@ -611,24 +610,28 @@ def senales_completas(interrupcion_id: int):
             raw[tipo]["valores"].append(float(r["valor"]))
 
         resultado = {}
+        
+        # Procesar ECG primero para tener referencia temporal
+        ts_ecg_ref = None
         for tipo, data in raw.items():
             ts = data["timestamps"]
             vs = data["valores"]
             if tipo.lower() == "ecg":
                 ts, vs = _limpiar_outliers_ecg(ts, vs)
+                ts_ecg_ref = ts  # Guardar referencia de timestamps del ECG
             resultado[tipo] = {"timestamps": ts, "valores": vs}
 
-        # Construir señal respiratoria (YA CORREGIDA en _construir_resp_desde_streaming)
+        # Construir señal respiratoria PASANDO LA REFERENCIA DEL ECG
         ts_flujo = raw.get("flujo",  {}).get("timestamps", [])
         vs_flujo = raw.get("flujo",  {}).get("valores",    [])
         ts_accz  = raw.get("acce_z", {}).get("timestamps", [])
         vs_accz  = raw.get("acce_z", {}).get("valores",    [])
 
         ts_resp, vs_resp = _construir_resp_desde_streaming(
-            ts_flujo, vs_flujo, ts_accz, vs_accz
+            ts_flujo, vs_flujo, ts_accz, vs_accz, ts_ecg_ref  # Pasar referencia ECG
         )
         resultado["frecuencia_respiratoria"] = {
-            "timestamps": ts_resp,  # YA EN SEGUNDOS Y NORMALIZADOS
+            "timestamps": ts_resp,
             "valores":    vs_resp
         }
 
@@ -655,7 +658,7 @@ def _limpiar_outliers_ecg(timestamps, valores):
 
 import math as _math
 
-def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
+def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz, ts_ecg_ref=None):
     def media_movil_gauss(valores, ventana):
         if len(valores) <= ventana:
             return valores[:]
@@ -721,12 +724,19 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
     tiene_flujo = len(ts_flujo) > 1
     tiene_accz  = len(ts_accz) > 1
 
+    # Determinar la duración de referencia (usar ECG si está disponible)
+    duracion_referencia_ms = 20000  # 20 segundos por defecto
+    if ts_ecg_ref and len(ts_ecg_ref) >= 2:
+        duracion_referencia_ms = ts_ecg_ref[-1] - ts_ecg_ref[0]
+        if duracion_referencia_ms <= 0:
+            duracion_referencia_ms = 20000
+
     # CASO 1: Solo flujo
     if tiene_flujo and not tiene_accz:
         ts_u, vs_i = interpolar_uniforme(ts_flujo, vs_flujo, 500)
         if ts_u:
             t0 = ts_u[0]
-            # CONVERTIR A SEGUNDOS y normalizar a partir de 0
+            # Convertir a segundos y normalizar a partir de 0
             ts_segundos = [(t - t0) / 1000.0 for t in ts_u]
             return ts_segundos, [round(v, 3) for v in vs_i]
         return [0], [0]
@@ -736,18 +746,18 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
         ts_u, vs_i = interpolar_uniforme(ts_accz, vs_accz, 500)
         if ts_u:
             t0 = ts_u[0]
-            # CONVERTIR A SEGUNDOS y normalizar a partir de 0
             ts_segundos = [(t - t0) / 1000.0 for t in ts_u]
             return ts_segundos, [round(v, 3) for v in vs_i]
         return [0], [0]
 
     # CASO 3: Combinación de flujo + aceleración Z
     if tiene_flujo and tiene_accz:
+        # Usar la misma escala temporal que el ECG
         t_global_min = min(ts_flujo[0], ts_accz[0])
         t_global_max = max(ts_flujo[-1], ts_accz[-1])
         duracion = t_global_max - t_global_min
         if duracion <= 0:
-            duracion = 20000
+            duracion = duracion_referencia_ms
 
         N = 500
         paso = duracion / (N - 1)
@@ -764,14 +774,12 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
 
         if ts_u:
             t0 = ts_u[0]
-            # CONVERTIR A SEGUNDOS y normalizar a partir de 0
             ts_segundos = [(t - t0) / 1000.0 for t in ts_u]
             return ts_segundos, [round(v, 3) for v in vs_comb]
 
-    # CASO 4: Señal sintética (sin datos reales)
-    duracion_segundos = 20.0  # 20 segundos por defecto
+    # CASO 4: Señal sintética
+    duracion_segundos = duracion_referencia_ms / 1000.0
     N = 500
-    # Crear timestamps en segundos directamente
     ts_segundos = [i * duracion_segundos / (N - 1) for i in range(N)]
     vs_sintetico = [round(155 + 30 * _math.sin(2 * _math.pi * 0.25 * t), 3) for t in ts_segundos]
     return ts_segundos, vs_sintetico
