@@ -724,61 +724,73 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz, ts_ecg
     tiene_flujo = len(ts_flujo) > 1
     tiene_accz  = len(ts_accz) > 1
 
-    # Determinar la duración de referencia (usar ECG si está disponible)
-    duracion_referencia_ms = 20000  # 20 segundos por defecto
+    # OBTENER LA DURACIÓN REAL DE LA APNEA desde los datos
+    # Primero, determinar la duración máxima disponible
+    duracion_total_ms = 20000  # 20 segundos por defecto
+    
+    # Si hay referencia ECG, usar su duración
     if ts_ecg_ref and len(ts_ecg_ref) >= 2:
-        duracion_referencia_ms = ts_ecg_ref[-1] - ts_ecg_ref[0]
-        if duracion_referencia_ms <= 0:
-            duracion_referencia_ms = 20000
+        duracion_total_ms = ts_ecg_ref[-1] - ts_ecg_ref[0]
+        if duracion_total_ms <= 0:
+            duracion_total_ms = 20000
+    # Si no hay ECG pero hay flujo, usar la duración del flujo
+    elif tiene_flujo:
+        duracion_total_ms = ts_flujo[-1] - ts_flujo[0]
+        if duracion_total_ms <= 0:
+            duracion_total_ms = 20000
+    # Si no hay flujo pero hay aceleración Z
+    elif tiene_accz:
+        duracion_total_ms = ts_accz[-1] - ts_accz[0]
+        if duracion_total_ms <= 0:
+            duracion_total_ms = 20000
+    
+    # Limitar a un máximo razonable (30 segundos)
+    if duracion_total_ms > 30000:
+        duracion_total_ms = 30000
 
     # CASO 1: Solo flujo
     if tiene_flujo and not tiene_accz:
-        ts_u, vs_i = interpolar_uniforme(ts_flujo, vs_flujo, 500)
-        if ts_u:
-            t0 = ts_u[0]
-            # Convertir a segundos y normalizar a partir de 0
-            ts_segundos = [(t - t0) / 1000.0 for t in ts_u]
-            return ts_segundos, [round(v, 3) for v in vs_i]
-        return [0], [0]
+        # Interpolar a 500 puntos en la duración total
+        t0 = ts_flujo[0]
+        t1 = t0 + duracion_total_ms
+        ts_uniforme = [int(t0 + i * duracion_total_ms / 499) for i in range(500)]
+        vs_interp = interp_en_ts(ts_flujo, vs_flujo, ts_uniforme)
+        # Convertir a segundos y normalizar a partir de 0
+        ts_segundos = [i * duracion_total_ms / 1000.0 / 499 for i in range(500)]
+        return ts_segundos, [round(v, 3) for v in vs_interp]
 
     # CASO 2: Solo aceleración Z
     if tiene_accz and not tiene_flujo:
-        ts_u, vs_i = interpolar_uniforme(ts_accz, vs_accz, 500)
-        if ts_u:
-            t0 = ts_u[0]
-            ts_segundos = [(t - t0) / 1000.0 for t in ts_u]
-            return ts_segundos, [round(v, 3) for v in vs_i]
-        return [0], [0]
+        t0 = ts_accz[0]
+        t1 = t0 + duracion_total_ms
+        ts_uniforme = [int(t0 + i * duracion_total_ms / 499) for i in range(500)]
+        vs_interp = interp_en_ts(ts_accz, vs_accz, ts_uniforme)
+        ts_segundos = [i * duracion_total_ms / 1000.0 / 499 for i in range(500)]
+        return ts_segundos, [round(v, 3) for v in vs_interp]
 
     # CASO 3: Combinación de flujo + aceleración Z
     if tiene_flujo and tiene_accz:
-        # Usar la misma escala temporal que el ECG
-        t_global_min = min(ts_flujo[0], ts_accz[0])
-        t_global_max = max(ts_flujo[-1], ts_accz[-1])
-        duracion = t_global_max - t_global_min
-        if duracion <= 0:
-            duracion = duracion_referencia_ms
-
-        N = 500
-        paso = duracion / (N - 1)
-        ts_u = [int(t_global_min + i * paso) for i in range(N)]
-
-        vs_flujo_i = interp_en_ts(ts_flujo, vs_flujo, ts_u)
-        vs_accz_i  = interp_en_ts(ts_accz,  vs_accz,  ts_u)
+        # Usar la duración total calculada
+        t_min = min(ts_flujo[0], ts_accz[0])
+        
+        # Crear timestamps uniformes en la duración total
+        ts_uniforme = [int(t_min + i * duracion_total_ms / 499) for i in range(500)]
+        
+        vs_flujo_i = interp_en_ts(ts_flujo, vs_flujo, ts_uniforme)
+        vs_accz_i  = interp_en_ts(ts_accz,  vs_accz,  ts_uniforme)
 
         f_min = min(vs_flujo_i)
         f_max = max(vs_flujo_i)
 
         vs_accz_norm = normalizar_al_rango(vs_accz_i, f_min, f_max)
         vs_comb = [0.70 * f + 0.30 * a for f, a in zip(vs_flujo_i, vs_accz_norm)]
-
-        if ts_u:
-            t0 = ts_u[0]
-            ts_segundos = [(t - t0) / 1000.0 for t in ts_u]
-            return ts_segundos, [round(v, 3) for v in vs_comb]
+        
+        # Convertir a segundos (timestamps normalizados de 0 a duracion_total_ms/1000)
+        ts_segundos = [i * duracion_total_ms / 1000.0 / 499 for i in range(500)]
+        return ts_segundos, [round(v, 3) for v in vs_comb]
 
     # CASO 4: Señal sintética
-    duracion_segundos = duracion_referencia_ms / 1000.0
+    duracion_segundos = duracion_total_ms / 1000.0
     N = 500
     ts_segundos = [i * duracion_segundos / (N - 1) for i in range(N)]
     vs_sintetico = [round(155 + 30 * _math.sin(2 * _math.pi * 0.25 * t), 3) for t in ts_segundos]
