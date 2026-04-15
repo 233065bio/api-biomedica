@@ -1771,8 +1771,11 @@ def admin_panel(request: Request):
                 let yScaleOpts;
                 if (tipo === 'ecg') {
                     const pad = Math.max((vMax - vMin) * 0.1, 5);
-                    yScaleOpts = { min: vMin - pad, max: vMax + pad,
-                        ticks: { font: { size: 10 }, color: '#5A7A8A', maxTicksLimit: 6, callback: (v) => v.toFixed(0)
+                    yScaleOpts = { 
+                        min: vMin - pad, max: vMax + pad,
+                        ticks: { font: { size: 10 }, color: '#5A7A8A', maxTicksLimit: 6, callback: (v) => v.toFixed(0) },
+                        grid: { color: '#EEF5FB' }
+                    };
                 } else {
                     const rango = vMax - vMin;
                     const pad = Math.max(rango * 0.10, 1.0);
