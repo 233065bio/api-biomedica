@@ -12,30 +12,6 @@ from typing import List
 
 app = FastAPI()
 
-def crear_tabla():
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS senales_esp32 (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            paciente VARCHAR(50),
-            tipo_senal VARCHAR(20),
-            timestamp_ms BIGINT,
-            valor FLOAT
-        )
-        """)
-
-        conn.commit()
-        cursor.close()
-        conn.close()
-
-        print("✅ Tabla creada correctamente")
-
-    except Exception as e:
-        print("❌ Error creando tabla:", e)
-
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
 
