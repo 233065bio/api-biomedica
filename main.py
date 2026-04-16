@@ -7,6 +7,8 @@ import os
 import bcrypt
 import json
 import math as _math
+from pydantic import BaseModel
+from typing import List
 
 app = FastAPI()
 
@@ -775,18 +777,44 @@ def senales_completas(interrupcion_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+class MuestraESP32(BaseModel):
+    paciente: str
+    timestamp_ms: int
+    ecg: float
+    spo2: float
+    acce_z: float
+    flujo: float
+
 @app.post("/senales")
-async def subir_senales(senales: List[SenalESP32]):
+async def subir_senales(senales: List[MuestraESP32]):
+    if not senales:
+        raise HTTPException(status_code=400, detail="Lista vacía")
     try:
+        print(senales)
         conn = get_db_connection()
         cursor = conn.cursor()
-        sql = "INSERT INTO senales_esp32 (interrupcion_id, tipo_senal, timestamp_ms, valor) VALUES (%s, %s, %s, %s)"
-        valores = [(s.interrupcion_id, s.tipo_senal, s.timestamp_ms, s.valor) for s in senales]
+
+        sql = "INSERT INTO senales_esp32 (paciente, tipo_senal, timestamp_ms, valor) VALUES (%s, %s, %s, %s)"
+
+        valores = []
+
+        for s in senales:
+            valores.extend([
+                (s.paciente, "ecg", s.timestamp_ms, s.ecg),
+                (s.paciente, "spo2", s.timestamp_ms, s.spo2),
+                (s.paciente, "acce_z", s.timestamp_ms, s.acce_z),
+                (s.paciente, "flujo", s.timestamp_ms, s.flujo),
+            ])
+
         cursor.executemany(sql, valores)
         conn.commit()
+
         cursor.close()
         conn.close()
-        return {"status": "success"}
+
+        return {"status": "success", "rows_inserted": len(valores)}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
