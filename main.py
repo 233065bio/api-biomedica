@@ -799,6 +799,163 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz, ts_ecg
     return ts_segundos, vs_sintetico
 
 # ─────────────────────────────────────────────
+# GESTOR DE WEBSOCKETS (MODO CALIBRACIÓN)
+# ─────────────────────────────────────────────
+class ConnectionManager:
+    def __init__(self):
+        # Aquí guardaremos a los usuarios que abran la página web
+        self.active_browsers: List[WebSocket] = []
+
+    async def connect_browser(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_browsers.append(websocket)
+
+    def disconnect_browser(self, websocket: WebSocket):
+        if websocket in self.active_browsers:
+            self.active_browsers.remove(websocket)
+
+    async def broadcast(self, message: str):
+        # Enviamos el JSON en crudo a todos los navegadores conectados
+        for connection in self.active_browsers:
+            try:
+                await connection.send_text(message)
+            except:
+                pass
+
+manager = ConnectionManager()
+
+# 1. Endpoint para el ESP32 (Tu ESP32 se conecta aquí)
+@app.websocket("/ws")
+async def websocket_esp32(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            # Recibimos el JSON del ESP32
+            data = await websocket.receive_text()
+            # Lo retransmitimos a las ventanas web abiertas
+            await manager.broadcast(data)
+    except WebSocketDisconnect:
+        print("ESP32 desconectado del WebSocket")
+
+# 2. Endpoint para el Navegador Web (Las gráficas)
+@app.websocket("/ws/browser")
+async def websocket_browser(websocket: WebSocket):
+    await manager.connect_browser(websocket)
+    try:
+        while True:
+            # Solo para mantener viva la conexión con el navegador
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect_browser(websocket)
+
+# 3. Interfaz Visual (HTML + Chart.js)
+@app.get("/calibracion", response_class=HTMLResponse)
+def vista_calibracion():
+    return """
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <title>Monitor en Tiempo Real</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+            body { font-family: Arial, sans-serif; background: #1e1e1e; color: #fff; text-align: center; padding: 20px; margin: 0; }
+            .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1200px; margin: 0 auto; }
+            .card { background: #2a2a2a; padding: 15px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+            h2, h4 { margin: 5px 0 15px 0; color: #e0e0e0; }
+            canvas { width: 100% !important; height: 250px !important; }
+            #estado { font-weight: bold; padding: 10px; border-radius: 5px; background: #333; display: inline-block; margin-bottom: 20px; }
+        </style>
+    </head>
+    <body>
+        <h2>📡 Monitor de Señales en Tiempo Real</h2>
+        <div id="estado" style="color: #ff9800;">Conectando al servidor...</div>
+        
+        <div class="grid">
+            <div class="card"><h4>ECG</h4><canvas id="chartECG"></canvas></div>
+            <div class="card"><h4>SpO2</h4><canvas id="chartSPO2"></canvas></div>
+            <div class="card"><h4>Flujo Respiratorio</h4><canvas id="chartFlujo"></canvas></div>
+            <div class="card"><h4>Movimiento (Acc Z)</h4><canvas id="chartAcc"></canvas></div>
+        </div>
+
+        <script>
+            // Mostrar un historial de 300 puntos
+            const maxPuntos = 300; 
+            
+            function crearChart(id, color) {
+                const ctx = document.getElementById(id).getContext('2d');
+                return new Chart(ctx, {
+                    type: 'line',
+                    data: { 
+                        labels: Array(maxPuntos).fill(''), 
+                        datasets: [{ 
+                            data: Array(maxPuntos).fill(0), 
+                            borderColor: color, 
+                            borderWidth: 2, 
+                            pointRadius: 0, 
+                            tension: 0.1 
+                        }] 
+                    },
+                    options: { 
+                        responsive: true, 
+                        animation: false, 
+                        scales: { x: { display: false } } 
+                    }
+                });
+            }
+
+            const chartECG = crearChart('chartECG', '#FF5733');
+            const chartSPO2 = crearChart('chartSPO2', '#33A8FF'); 
+            const chartFlujo = crearChart('chartFlujo', '#33FF57');
+            const chartAcc = crearChart('chartAcc', '#A833FF');
+
+            const protocolo = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+            const ws = new WebSocket(protocol + window.location.host + '/ws/browser');
+
+            ws.onopen = () => {
+                const el = document.getElementById('estado');
+                el.innerText = "🟢 Esperando datos del ESP32...";
+                el.style.color = "#4caf50";
+            };
+            
+            ws.onclose = () => {
+                const el = document.getElementById('estado');
+                el.innerText = "🔴 Servidor Desconectado";
+                el.style.color = "#f44336";
+            };
+
+            ws.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    actualizarValorUnico(chartSPO2, data.spo2);
+                    actualizarArreglo(chartECG, data.ecg);
+                    actualizarArreglo(chartAcc, data.mpu_z);
+                    actualizarArreglo(chartFlujo, data.flujo);
+                } catch(e) {
+                    console.error("Error procesando JSON", e);
+                }
+            };
+
+            function actualizarValorUnico(chart, valor) {
+                if(valor === undefined) return;
+                const arr = chart.data.datasets[0].data;
+                arr.push(valor);
+                arr.shift();
+                chart.update();
+            }
+
+            function actualizarArreglo(chart, arregloValores) {
+                if(!arregloValores || arregloValores.length === 0) return;
+                const arr = chart.data.datasets[0].data;
+                arregloValores.forEach(val => { arr.push(val); arr.shift(); });
+                chart.update();
+            }
+        </script>
+    </body>
+    </html>
+    """
+
+# ─────────────────────────────────────────────
 # ENDPOINTS ESP32
 # ─────────────────────────────────────────────
 @app.get("/datos-sensores")
