@@ -1421,37 +1421,6 @@ def admin_panel(request: Request):
         };
 
         // ════════════════════════════════════════════
-        // FILTROS EN TIEMPO REAL
-        // ════════════════════════════════════════════
-        // Configuración de filtros
-        const VENTANA_MEDIA = 5;          // muestras para media móvil (SpO2, Acce Z, Flujo)
-        const ALPHA_EXP = 0.3;            // factor de suavizado exponencial para ECG (0.3 = respuesta rápida)
-
-        // Buffers para media móvil
-        const buffers = {
-            spo2:   [],
-            acce_z: [],
-            flujo:  []
-        };
-
-        // Estado para filtro exponencial (ECG)
-        let filtroEcg = null;
-
-        function mediaMovil(nuevoValor, tipo) {
-            const buf = buffers[tipo];
-            buf.push(nuevoValor);
-            if (buf.length > VENTANA_MEDIA) buf.shift();
-            const suma = buf.reduce((a,b) => a + b, 0);
-            return suma / buf.length;
-        }
-
-        function filtroExponencial(nuevoValor) {
-            if (filtroEcg === null) filtroEcg = nuevoValor;
-            filtroEcg = ALPHA_EXP * nuevoValor + (1 - ALPHA_EXP) * filtroEcg;
-            return filtroEcg;
-        }
-
-        // ════════════════════════════════════════════
         // UTILIDADES
         // ════════════════════════════════════════════
         function mostrarToast(msg) {
@@ -1647,9 +1616,12 @@ def admin_panel(request: Request):
         }
 
         // ════════════════════════════════════════════
-        // SEÑALES EN VIVO — WebSocket + /stream + FILTROS
+        // SEÑALES EN VIVO — WebSocket + /stream
+        // El ESP32 hace POST a /stream cada 200 ms;
+        // la API difunde ese JSON por WS a /ws/browser.
+        // Formato recibido: { tipo:"stream", paciente, timestamp_ms, ecg, spo2, acce_z, flujo }
         // ════════════════════════════════════════════
-        const MAX_PUNTOS = 150;   // ventana deslizante
+        const MAX_PUNTOS = 150;   // ventana deslizante de 30 s a 200 ms/muestra
 
         // ── Crear una gráfica en vivo sin relleno, con eje Y fijo para ECG ──
         function crearChartVivo(canvasId, color, yLabel, minY = null, maxY = null, fillEnabled = false) {
@@ -1659,7 +1631,7 @@ def admin_panel(request: Request):
                 maintainAspectRatio: false,
                 animation: false,
                 layout: {
-                    padding: { top: 2, bottom: 2, left: 2, right: 2 }
+                    padding: { top: 2, bottom: 2, left: 2, right: 2 }  // reducir espacios internos
                 },
                 plugins: {
                     legend: { display: false },
@@ -1686,17 +1658,17 @@ def admin_panel(request: Request):
                         data: [],
                         borderColor: color,
                         backgroundColor: fillEnabled ? color.replace(')', ', 0.08)').replace('rgb', 'rgba') : 'transparent',
-                        borderWidth: 1.2,
-                        tension: 0.5,          // más suavizado visual
-                        pointRadius: 0,        // ocultar puntos para líneas más limpias
-                        fill: false,
+                        borderWidth: 1.6,
+                        tension: 0.35,
+                        pointRadius: 0,
+                        fill: fillEnabled,
                     }]
                 },
                 options: options
             });
         }
 
-        // Inicializar las 4 gráficas en vivo
+        // Inicializar las 4 gráficas en vivo (sin relleno, ECG con eje fijo -50..50)
         const chartVivo = {
             ecg:    crearChartVivo('chartECG',   '#E05C5C', 'mV', -50, 50, false),
             spo2:   crearChartVivo('chartSPO2',  '#5C9AE0', '%',   null, null, false),
@@ -1704,6 +1676,7 @@ def admin_panel(request: Request):
             flujo:  crearChartVivo('chartFLUJO', '#E0A55C', 'ADC', null, null, false),
         };
 
+        // ── Agregar un punto a una gráfica, manteniendo ventana deslizante ────────
         function pushPunto(chart, label, valor) {
             chart.data.labels.push(label);
             chart.data.datasets[0].data.push(valor);
@@ -1711,9 +1684,10 @@ def admin_panel(request: Request):
                 chart.data.labels.shift();
                 chart.data.datasets[0].data.shift();
             }
-            chart.update('none');
+            chart.update('none');   // sin animación para máxima fluidez
         }
 
+        // ── Actualizar indicadores numéricos con color según umbral ───────────────
         function actualizarIndicador(idVal, idCard, valor, unidad, umbralWarn, umbralCrit, invertir) {
             const el = document.getElementById(idVal);
             const card = document.getElementById(idCard);
@@ -1727,9 +1701,11 @@ def admin_panel(request: Request):
             else if (advertencia) card.classList.add('tv-warn');
         }
 
+        // ── WebSocket al servidor ─────────────────────────────────────────────────
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
         let ws;
+
         function conectarWS() {
-            const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
             ws = new WebSocket(wsProtocol + window.location.host + '/ws/browser');
 
             ws.onopen = () => {
@@ -1740,7 +1716,7 @@ def admin_panel(request: Request):
             ws.onclose = () => {
                 document.getElementById('ws-dot').className   = 'ws-dot off';
                 document.getElementById('ws-label').textContent = 'Sin conexión — reconectando...';
-                setTimeout(conectarWS, 3000);
+                setTimeout(conectarWS, 3000);   // reconexión automática
             };
 
             ws.onerror = () => ws.close();
@@ -1748,10 +1724,13 @@ def admin_panel(request: Request):
             ws.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
+
+                    // Solo procesar mensajes de tipo "stream" del ESP32
                     if (data.tipo !== 'stream') return;
 
                     const ts = new Date().toLocaleTimeString('es-MX', { hour12: false });
 
+                    // ── Chip de paciente ─────────────────────────────────────────
                     if (data.paciente) {
                         const wrap = document.getElementById('vivo-paciente-wrap');
                         const chip = document.getElementById('vivo-paciente-chip');
@@ -1759,35 +1738,32 @@ def admin_panel(request: Request):
                         chip.textContent = '👤 ' + data.paciente;
                     }
 
+                    // ── Estado WS activo ─────────────────────────────────────────
                     document.getElementById('ws-dot').className   = 'ws-dot on';
                     document.getElementById('ws-label').textContent = 'Transmitiendo en vivo';
 
-                    // ── ECG: filtro exponencial ──
+                    // ── ECG ───────────────────────────────────────────────────────
                     if (data.ecg !== undefined) {
-                        const valorFiltrado = filtroExponencial(data.ecg);
-                        pushPunto(chartVivo.ecg, ts, valorFiltrado);
-                        document.getElementById('val-ecg').textContent = valorFiltrado.toFixed(1);
+                        pushPunto(chartVivo.ecg, ts, data.ecg);
+                        document.getElementById('val-ecg').textContent = parseFloat(data.ecg).toFixed(1);
                     }
 
-                    // ── SpO2: media móvil ──
+                    // ── SpO2: crítico < 90, advertencia < 95 ─────────────────────
                     if (data.spo2 !== undefined) {
-                        const valorFiltrado = mediaMovil(data.spo2, 'spo2');
-                        pushPunto(chartVivo.spo2, ts, valorFiltrado);
-                        actualizarIndicador('val-spo2', 'tv-spo2', valorFiltrado, '%', 95, 90, true);
+                        pushPunto(chartVivo.spo2, ts, data.spo2);
+                        actualizarIndicador('val-spo2', 'tv-spo2', data.spo2, '%', 95, 90, true);
                     }
 
-                    // ── Aceleración Z: media móvil ──
+                    // ── Aceleración Z ─────────────────────────────────────────────
                     if (data.acce_z !== undefined) {
-                        const valorFiltrado = mediaMovil(data.acce_z, 'acce_z');
-                        pushPunto(chartVivo.acce_z, ts, valorFiltrado);
-                        document.getElementById('val-accz').textContent = valorFiltrado.toFixed(3);
+                        pushPunto(chartVivo.acce_z, ts, data.acce_z);
+                        document.getElementById('val-accz').textContent = parseFloat(data.acce_z).toFixed(3);
                     }
 
-                    // ── Flujo: media móvil ──
+                    // ── Flujo respiratorio ────────────────────────────────────────
                     if (data.flujo !== undefined) {
-                        const valorFiltrado = mediaMovil(data.flujo, 'flujo');
-                        pushPunto(chartVivo.flujo, ts, valorFiltrado);
-                        document.getElementById('val-flujo').textContent = Math.round(valorFiltrado);
+                        pushPunto(chartVivo.flujo, ts, data.flujo);
+                        document.getElementById('val-flujo').textContent = parseInt(data.flujo);
                     }
 
                 } catch(e) {
@@ -1799,7 +1775,7 @@ def admin_panel(request: Request):
         conectarWS();
 
         // ════════════════════════════════════════════
-        // VISOR DE SEÑALES (sin cambios)
+        // VISOR DE SEÑALES
         // ════════════════════════════════════════════
         async function iniciarVisor() {
             const res = await fetch('/pacientes');
@@ -2157,6 +2133,7 @@ def admin_panel(request: Request):
             apneaActivaId = null;
         }
 
+        // ── Inicio ──
         window.onload = cargarPacientes;
     </script>
     </body>
