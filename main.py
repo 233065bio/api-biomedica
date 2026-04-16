@@ -163,6 +163,19 @@ class LoginRequest(BaseModel):
 class AnotacionModel(BaseModel):
     anotacion: str
 
+# ─────────────────────────────────────────────
+# NUEVO MODELO: Muestra de streaming en tiempo real
+# Enviada por el ESP32 cada INTERVALO_STREAM_MS ms (200 ms)
+# Campos: paciente, timestamp_ms, ecg, spo2, acce_z, flujo
+# ─────────────────────────────────────────────
+class MuestraStream(BaseModel):
+    paciente: str
+    timestamp_ms: int
+    ecg: float
+    spo2: float
+    acce_z: float
+    flujo: float
+
 def timedelta_a_str(valor):
     if valor is None:
         return None
@@ -173,7 +186,6 @@ def timedelta_a_str(valor):
 
 # ─────────────────────────────────────────────
 # WEBSOCKETS (TRANSMISIÓN EN TIEMPO REAL)
-# Modo dual: ESP32 envía a /ws, navegadores escuchan en /ws/browser
 # ─────────────────────────────────────────────
 class ConnectionManager:
     def __init__(self):
@@ -188,11 +200,11 @@ class ConnectionManager:
             self.active_browsers.remove(websocket)
 
     async def broadcast(self, message: str):
-        for connection in self.active_browsers:
+        for connection in self.active_browsers[:]:
             try:
                 await connection.send_text(message)
             except Exception:
-                pass
+                self.active_browsers.remove(connection)
 
 manager = ConnectionManager()
 
@@ -214,6 +226,41 @@ async def websocket_browser(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect_browser(websocket)
+
+# ─────────────────────────────────────────────
+# ENDPOINT /stream — RECIBE MUESTRAS EN TIEMPO REAL DEL ESP32
+# El ESP32 hace POST aquí cada 200 ms con una muestra de todas las señales.
+# La API reenvía el dato via WebSocket a los navegadores conectados.
+# ─────────────────────────────────────────────
+import asyncio
+
+@app.post("/stream")
+async def recibir_stream(muestra: MuestraStream):
+    """
+    Recibe una muestra en tiempo real del ESP32 y la difunde
+    a todos los navegadores suscritos via WebSocket (/ws/browser).
+    Formato enviado al navegador (JSON):
+      {
+        "paciente":     "Prosim",
+        "timestamp_ms": 12345,
+        "ecg":          42.5,
+        "spo2":         97,
+        "acce_z":       0.123,
+        "flujo":        1800,
+        "tipo":         "stream"
+      }
+    """
+    payload = {
+        "tipo":         "stream",
+        "paciente":     muestra.paciente,
+        "timestamp_ms": muestra.timestamp_ms,
+        "ecg":          muestra.ecg,
+        "spo2":         muestra.spo2,
+        "acce_z":       muestra.acce_z,
+        "flujo":        muestra.flujo,
+    }
+    await manager.broadcast(json.dumps(payload))
+    return {"status": "ok"}
 
 # ─────────────────────────────────────────────
 # LOGIN
@@ -987,14 +1034,38 @@ def admin_panel(request: Request):
             .card-actions { margin-top: 15px; display: flex; gap: 8px; }
 
             /* ── Señales en Vivo ── */
-            .indicadores-vivo { display: flex; justify-content: center; gap: 20px; margin-bottom: 20px; }
-            .tarjeta-vivo { background: white; padding: 15px 25px; border-radius: 8px;
+            .vivo-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+            .vivo-header h2 { font-size: 18px; }
+            .ws-pill { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px;
+                       border-radius: 20px; font-size: 12px; font-weight: bold; background: #EEF5FB;
+                       border: 1px solid #D4E8F3; color: #5A7A8A; }
+            .ws-dot { width: 8px; height: 8px; border-radius: 50%; background: #ccc; }
+            .ws-dot.on  { background: #4CAF50; box-shadow: 0 0 6px #4CAF50; animation: pulse 1.5s infinite; }
+            .ws-dot.off { background: #D65C5C; }
+            @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+            .indicadores-vivo { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 20px; }
+            .tarjeta-vivo { background: white; padding: 14px 18px; border-radius: 8px;
                             box-shadow: 0 4px 6px rgba(0,0,0,0.05); text-align: center;
-                            border: 1px solid #D4E8F3; width: 200px; }
-            .tarjeta-vivo h3 { margin: 0; font-size: 14px; color: #5A7A8A; border: none; padding: 0; }
-            .tarjeta-vivo p { margin: 5px 0 0 0; font-size: 28px; font-weight: bold; color: #2C4A5A; }
-            .chart-container { background: white; padding: 15px; border-radius: 8px; margin-bottom: 20px;
-                                box-shadow: 0 4px 6px rgba(0,0,0,0.05); border: 1px solid #D4E8F3; height: 220px; }
+                            border: 1px solid #D4E8F3; }
+            .tarjeta-vivo .tv-label { font-size: 11px; color: #5A7A8A; font-weight: bold;
+                                      text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+            .tarjeta-vivo .tv-val   { font-size: 28px; font-weight: bold; color: #2C4A5A; line-height: 1; }
+            .tarjeta-vivo .tv-unit  { font-size: 11px; color: #5A7A8A; margin-top: 4px; }
+            .tarjeta-vivo.tv-warn   { border-color: #F5A623; background: #FFFBF0; }
+            .tarjeta-vivo.tv-crit   { border-color: #D65C5C; background: #FFF5F5; }
+            .tarjeta-vivo.tv-crit .tv-val { color: #D65C5C; }
+
+            .vivo-paciente-chip { background: #E3F2FA; border: 1px solid #7AAFC5; padding: 5px 14px;
+                                  border-radius: 20px; font-size: 13px; font-weight: bold; color: #2C4A5A;
+                                  display: inline-block; margin-bottom: 16px; }
+
+            .charts-grid-vivo { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+            .chart-card-vivo { background: white; border: 1px solid #D4E8F3; border-radius: 8px;
+                               padding: 14px; }
+            .chart-card-vivo h4 { font-size: 11px; color: #5A7A8A; text-transform: uppercase;
+                                  letter-spacing: 0.5px; margin-bottom: 10px; font-weight: bold; }
+            .chart-card-vivo canvas { height: 170px !important; }
 
             /* ── Visor de Señales ── */
             .visor-layout { display: grid; grid-template-columns: 300px 1fr; gap: 20px; }
@@ -1116,16 +1187,62 @@ def admin_panel(request: Request):
 
         <!-- ══ SEÑALES EN VIVO ══ -->
         <div id="sec-vivo" class="section">
-            <h2 style="margin-bottom:8px; font-size:18px;">🟢 Monitoreo en Vivo</h2>
-            <div id="ws-status" style="text-align:center; color:#888; font-size:13px; margin-bottom:20px;">
-                Buscando conexión con el equipo... ⏳
+            <div class="vivo-header">
+                <h2>🟢 Monitoreo en Vivo — ESP32</h2>
+                <span class="ws-pill" id="ws-pill">
+                    <span class="ws-dot" id="ws-dot"></span>
+                    <span id="ws-label">Esperando equipo...</span>
+                </span>
             </div>
+
+            <!-- Chip del paciente activo -->
+            <div id="vivo-paciente-wrap" style="display:none;">
+                <span class="vivo-paciente-chip" id="vivo-paciente-chip">👤 —</span>
+            </div>
+
+            <!-- Indicadores numéricos: ECG, SpO2, Acce Z, Flujo -->
             <div class="indicadores-vivo">
-                <div class="tarjeta-vivo"><h3>SpO2 (%)</h3><p id="val-spo2">--</p></div>
-                <div class="tarjeta-vivo"><h3>Apneas Detectadas</h3><p id="val-apneas">--</p></div>
+                <div class="tarjeta-vivo" id="tv-ecg">
+                    <div class="tv-label">ECG</div>
+                    <div class="tv-val" id="val-ecg">--</div>
+                    <div class="tv-unit">mV</div>
+                </div>
+                <div class="tarjeta-vivo" id="tv-spo2">
+                    <div class="tv-label">SpO₂</div>
+                    <div class="tv-val" id="val-spo2">--</div>
+                    <div class="tv-unit">%</div>
+                </div>
+                <div class="tarjeta-vivo" id="tv-accz">
+                    <div class="tv-label">Aceleración Z</div>
+                    <div class="tv-val" id="val-accz">--</div>
+                    <div class="tv-unit">m/s²</div>
+                </div>
+                <div class="tarjeta-vivo" id="tv-flujo">
+                    <div class="tv-label">Flujo Resp.</div>
+                    <div class="tv-val" id="val-flujo">--</div>
+                    <div class="tv-unit">ADC</div>
+                </div>
             </div>
-            <div class="chart-container"><canvas id="chartECG"></canvas></div>
-            <div class="chart-container"><canvas id="chartFlujo"></canvas></div>
+
+            <!-- Gráficas 2×2 -->
+            <div class="charts-grid-vivo">
+                <div class="chart-card-vivo">
+                    <h4>❤️ ECG</h4>
+                    <canvas id="chartECG"></canvas>
+                </div>
+                <div class="chart-card-vivo">
+                    <h4>🩸 SpO₂ (%)</h4>
+                    <canvas id="chartSPO2"></canvas>
+                </div>
+                <div class="chart-card-vivo">
+                    <h4>🔵 Aceleración Z (m/s²)</h4>
+                    <canvas id="chartACCZ"></canvas>
+                </div>
+                <div class="chart-card-vivo">
+                    <h4>💨 Flujo Respiratorio (ADC)</h4>
+                    <canvas id="chartFLUJO"></canvas>
+                </div>
+            </div>
         </div>
 
         <!-- ══ VISOR DE SEÑALES ══ -->
@@ -1454,63 +1571,152 @@ def admin_panel(request: Request):
         }
 
         // ════════════════════════════════════════════
-        // SEÑALES EN VIVO (WebSocket)
+        // SEÑALES EN VIVO — WebSocket + /stream
+        // El ESP32 hace POST a /stream cada 200 ms;
+        // la API difunde ese JSON por WS a /ws/browser.
+        // Formato recibido: { tipo:"stream", paciente, timestamp_ms, ecg, spo2, acce_z, flujo }
         // ════════════════════════════════════════════
-        const maxPuntos = 200;
+        const MAX_PUNTOS = 150;   // ventana deslizante de 30 s a 200 ms/muestra
 
-        function crearChartVivo(canvasId, label, color) {
+        // ── Crear una gráfica en vivo ─────────────────────────────────────────────
+        function crearChartVivo(canvasId, color, yLabel) {
             const ctx = document.getElementById(canvasId).getContext('2d');
             return new Chart(ctx, {
                 type: 'line',
                 data: {
                     labels: [],
-                    datasets: [{ label, data: [], borderColor: color, borderWidth: 1.8,
-                                 tension: 0.2, pointRadius: 0 }]
+                    datasets: [{
+                        data: [],
+                        borderColor: color,
+                        backgroundColor: color.replace(')', ', 0.08)').replace('rgb', 'rgba'),
+                        borderWidth: 1.6,
+                        tension: 0.35,
+                        pointRadius: 0,
+                        fill: true,
+                    }]
                 },
                 options: {
-                    responsive: true, maintainAspectRatio: false, animation: false,
-                    scales: { x: { display: false }, y: { grid: { color: '#EEF5FB' } } },
-                    plugins: { legend: { labels: { color: '#2C4A5A' } } }
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { display: false },
+                        y: {
+                            grid: { color: '#EEF5FB' },
+                            ticks: { font: { size: 10 }, color: '#5A7A8A', maxTicksLimit: 5 },
+                            title: { display: false }
+                        }
+                    }
                 }
             });
         }
 
-        const chartECG   = crearChartVivo('chartECG',   'ECG / FC',          '#D65C5C');
-        const chartFlujo = crearChartVivo('chartFlujo', 'Flujo Respiratorio', '#7AAFC5');
+        // Inicializar las 4 gráficas en vivo
+        const chartVivo = {
+            ecg:    crearChartVivo('chartECG',   '#E05C5C'),
+            spo2:   crearChartVivo('chartSPO2',  '#5C9AE0'),
+            acce_z: crearChartVivo('chartACCZ',  '#5CBE80'),
+            flujo:  crearChartVivo('chartFLUJO', '#E0A55C'),
+        };
 
+        // ── Agregar un punto a una gráfica, manteniendo ventana deslizante ────────
+        function pushPunto(chart, label, valor) {
+            chart.data.labels.push(label);
+            chart.data.datasets[0].data.push(valor);
+            if (chart.data.labels.length > MAX_PUNTOS) {
+                chart.data.labels.shift();
+                chart.data.datasets[0].data.shift();
+            }
+            chart.update('none');   // sin animación para máxima fluidez
+        }
+
+        // ── Actualizar indicadores numéricos con color según umbral ───────────────
+        function actualizarIndicador(idVal, idCard, valor, unidad, umbralWarn, umbralCrit, invertir) {
+            const el = document.getElementById(idVal);
+            const card = document.getElementById(idCard);
+            if (el) el.textContent = typeof valor === 'number' ? valor.toFixed(unidad === '%' ? 0 : 1) : '--';
+            if (!card) return;
+            card.classList.remove('tv-warn', 'tv-crit');
+            if (valor === null) return;
+            const critico = invertir ? valor < umbralCrit : valor > umbralCrit;
+            const advertencia = invertir ? valor < umbralWarn : valor > umbralWarn;
+            if (critico)      card.classList.add('tv-crit');
+            else if (advertencia) card.classList.add('tv-warn');
+        }
+
+        // ── WebSocket al servidor ─────────────────────────────────────────────────
         const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-        const ws = new WebSocket(wsProtocol + window.location.host + '/ws/browser');
+        let ws;
 
-        ws.onopen = () => {
-            document.getElementById('ws-status').innerHTML = "✅ Equipo conectado y transmitiendo";
-            document.getElementById('ws-status').style.color = "#4CAF50";
-        };
-        ws.onclose = () => {
-            document.getElementById('ws-status').innerHTML = "❌ Conexión perdida. Intentando reconectar...";
-            document.getElementById('ws-status').style.color = "#D65C5C";
-        };
-        ws.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                if (data.spo2 !== undefined) document.getElementById('val-spo2').innerText = data.spo2;
-                if (data.no_apnea !== undefined) document.getElementById('val-apneas').innerText = data.no_apnea;
-                const timeNow = new Date().toLocaleTimeString();
-                function pushChart(chart, arr) {
-                    if (!arr || !Array.isArray(arr)) return;
-                    arr.forEach(val => {
-                        chart.data.labels.push(timeNow);
-                        chart.data.datasets[0].data.push(val);
-                        if (chart.data.labels.length > maxPuntos) {
-                            chart.data.labels.shift();
-                            chart.data.datasets[0].data.shift();
-                        }
-                    });
-                    chart.update();
+        function conectarWS() {
+            ws = new WebSocket(wsProtocol + window.location.host + '/ws/browser');
+
+            ws.onopen = () => {
+                document.getElementById('ws-dot').className   = 'ws-dot on';
+                document.getElementById('ws-label').textContent = 'Conectado — esperando datos...';
+            };
+
+            ws.onclose = () => {
+                document.getElementById('ws-dot').className   = 'ws-dot off';
+                document.getElementById('ws-label').textContent = 'Sin conexión — reconectando...';
+                setTimeout(conectarWS, 3000);   // reconexión automática
+            };
+
+            ws.onerror = () => ws.close();
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+
+                    // Solo procesar mensajes de tipo "stream" del ESP32
+                    if (data.tipo !== 'stream') return;
+
+                    const ts = new Date().toLocaleTimeString('es-MX', { hour12: false });
+
+                    // ── Chip de paciente ─────────────────────────────────────────
+                    if (data.paciente) {
+                        const wrap = document.getElementById('vivo-paciente-wrap');
+                        const chip = document.getElementById('vivo-paciente-chip');
+                        wrap.style.display = 'block';
+                        chip.textContent = '👤 ' + data.paciente;
+                    }
+
+                    // ── Estado WS activo ─────────────────────────────────────────
+                    document.getElementById('ws-dot').className   = 'ws-dot on';
+                    document.getElementById('ws-label').textContent = 'Transmitiendo en vivo';
+
+                    // ── ECG ───────────────────────────────────────────────────────
+                    if (data.ecg !== undefined) {
+                        pushPunto(chartVivo.ecg, ts, data.ecg);
+                        document.getElementById('val-ecg').textContent = parseFloat(data.ecg).toFixed(1);
+                    }
+
+                    // ── SpO2: crítico < 90, advertencia < 95 ─────────────────────
+                    if (data.spo2 !== undefined) {
+                        pushPunto(chartVivo.spo2, ts, data.spo2);
+                        actualizarIndicador('val-spo2', 'tv-spo2', data.spo2, '%', 95, 90, true);
+                    }
+
+                    // ── Aceleración Z ─────────────────────────────────────────────
+                    if (data.acce_z !== undefined) {
+                        pushPunto(chartVivo.acce_z, ts, data.acce_z);
+                        document.getElementById('val-accz').textContent = parseFloat(data.acce_z).toFixed(3);
+                    }
+
+                    // ── Flujo respiratorio ────────────────────────────────────────
+                    if (data.flujo !== undefined) {
+                        pushPunto(chartVivo.flujo, ts, data.flujo);
+                        document.getElementById('val-flujo').textContent = parseInt(data.flujo);
+                    }
+
+                } catch(e) {
+                    console.warn('[WS] Error al parsear:', e);
                 }
-                pushChart(chartECG,   data.ecg);
-                pushChart(chartFlujo, data.flujo);
-            } catch(e) { console.log("Error WS:", e); }
-        };
+            };
+        }
+
+        conectarWS();
 
         // ════════════════════════════════════════════
         // VISOR DE SEÑALES
