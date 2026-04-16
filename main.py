@@ -1113,10 +1113,8 @@ def admin_panel(request: Request):
 
             .charts-grid-vivo { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
             .chart-card-vivo { background: white; border: 1px solid #D4E8F3; border-radius: 8px;
-                               padding: 14px; }
-            .chart-card-vivo h4 { font-size: 11px; color: #5A7A8A; text-transform: uppercase;
-                                  letter-spacing: 0.5px; margin-bottom: 10px; font-weight: bold; }
-            .chart-card-vivo canvas { height: 170px !important; }
+                               padding: 8px; }  /* Padding reducido para eliminar espacios */
+            .chart-card-vivo canvas { height: 170px !important; width: 100%; }
 
             /* ── Visor de Señales ── */
             .visor-layout { display: grid; grid-template-columns: 300px 1fr; gap: 20px; }
@@ -1275,22 +1273,18 @@ def admin_panel(request: Request):
                 </div>
             </div>
 
-            <!-- Gráficas 2×2 -->
+            <!-- Gráficas 2×2 sin títulos y sin relleno -->
             <div class="charts-grid-vivo">
                 <div class="chart-card-vivo">
-                    <h4>❤️ ECG</h4>
                     <canvas id="chartECG"></canvas>
                 </div>
                 <div class="chart-card-vivo">
-                    <h4>🩸 SpO₂ (%)</h4>
                     <canvas id="chartSPO2"></canvas>
                 </div>
                 <div class="chart-card-vivo">
-                    <h4>🔵 Aceleración Z (m/s²)</h4>
                     <canvas id="chartACCZ"></canvas>
                 </div>
                 <div class="chart-card-vivo">
-                    <h4>💨 Flujo Respiratorio (ADC)</h4>
                     <canvas id="chartFLUJO"></canvas>
                 </div>
             </div>
@@ -1629,9 +1623,33 @@ def admin_panel(request: Request):
         // ════════════════════════════════════════════
         const MAX_PUNTOS = 150;   // ventana deslizante de 30 s a 200 ms/muestra
 
-        // ── Crear una gráfica en vivo ─────────────────────────────────────────────
-        function crearChartVivo(canvasId, color, yLabel) {
+        // ── Crear una gráfica en vivo sin relleno, con eje Y fijo para ECG ──
+        function crearChartVivo(canvasId, color, yLabel, minY = null, maxY = null, fillEnabled = false) {
             const ctx = document.getElementById(canvasId).getContext('2d');
+            const options = {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: false,
+                layout: {
+                    padding: { top: 2, bottom: 2, left: 2, right: 2 }  // reducir espacios internos
+                },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: { enabled: false }
+                },
+                scales: {
+                    x: { display: false },
+                    y: {
+                        grid: { color: '#EEF5FB' },
+                        ticks: { font: { size: 10 }, color: '#5A7A8A', maxTicksLimit: 4 },
+                        title: { display: false }
+                    }
+                }
+            };
+            if (minY !== null && maxY !== null) {
+                options.scales.y.min = minY;
+                options.scales.y.max = maxY;
+            }
             return new Chart(ctx, {
                 type: 'line',
                 data: {
@@ -1639,36 +1657,23 @@ def admin_panel(request: Request):
                     datasets: [{
                         data: [],
                         borderColor: color,
-                        backgroundColor: color.replace(')', ', 0.08)').replace('rgb', 'rgba'),
+                        backgroundColor: fillEnabled ? color.replace(')', ', 0.08)').replace('rgb', 'rgba') : 'transparent',
                         borderWidth: 1.6,
                         tension: 0.35,
                         pointRadius: 0,
-                        fill: true,
+                        fill: fillEnabled,
                     }]
                 },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    animation: false,
-                    plugins: { legend: { display: false } },
-                    scales: {
-                        x: { display: false },
-                        y: {
-                            grid: { color: '#EEF5FB' },
-                            ticks: { font: { size: 10 }, color: '#5A7A8A', maxTicksLimit: 5 },
-                            title: { display: false }
-                        }
-                    }
-                }
+                options: options
             });
         }
 
-        // Inicializar las 4 gráficas en vivo
+        // Inicializar las 4 gráficas en vivo (sin relleno, ECG con eje fijo -50..50)
         const chartVivo = {
-            ecg:    crearChartVivo('chartECG',   '#E05C5C'),
-            spo2:   crearChartVivo('chartSPO2',  '#5C9AE0'),
-            acce_z: crearChartVivo('chartACCZ',  '#5CBE80'),
-            flujo:  crearChartVivo('chartFLUJO', '#E0A55C'),
+            ecg:    crearChartVivo('chartECG',   '#E05C5C', 'mV', -50, 50, false),
+            spo2:   crearChartVivo('chartSPO2',  '#5C9AE0', '%',   null, null, false),
+            acce_z: crearChartVivo('chartACCZ',  '#5CBE80', 'm/s²', null, null, false),
+            flujo:  crearChartVivo('chartFLUJO', '#E0A55C', 'ADC', null, null, false),
         };
 
         // ── Agregar un punto a una gráfica, manteniendo ventana deslizante ────────
