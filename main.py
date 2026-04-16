@@ -1095,7 +1095,8 @@ def admin_panel(request: Request):
             .ws-dot.off { background: #D65C5C; }
             @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
-            .indicadores-vivo { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 20px; }
+            /* Solo dos indicadores: ECG y Aceleración Z */
+            .indicadores-vivo { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-bottom: 20px; }
             .tarjeta-vivo { background: white; padding: 14px 18px; border-radius: 8px;
                             box-shadow: 0 4px 6px rgba(0,0,0,0.05); text-align: center;
                             border: 1px solid #D4E8F3; }
@@ -1103,17 +1104,15 @@ def admin_panel(request: Request):
                                       text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
             .tarjeta-vivo .tv-val   { font-size: 28px; font-weight: bold; color: #2C4A5A; line-height: 1; }
             .tarjeta-vivo .tv-unit  { font-size: 11px; color: #5A7A8A; margin-top: 4px; }
-            .tarjeta-vivo.tv-warn   { border-color: #F5A623; background: #FFFBF0; }
-            .tarjeta-vivo.tv-crit   { border-color: #D65C5C; background: #FFF5F5; }
-            .tarjeta-vivo.tv-crit .tv-val { color: #D65C5C; }
 
             .vivo-paciente-chip { background: #E3F2FA; border: 1px solid #7AAFC5; padding: 5px 14px;
                                   border-radius: 20px; font-size: 13px; font-weight: bold; color: #2C4A5A;
                                   display: inline-block; margin-bottom: 16px; }
 
+            /* Gráficas en vivo: 2 columnas (ECG y Aceleración Z) */
             .charts-grid-vivo { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
             .chart-card-vivo { background: white; border: 1px solid #D4E8F3; border-radius: 8px;
-                               padding: 8px; }  /* Padding reducido para eliminar espacios */
+                               padding: 8px; }
             .chart-card-vivo canvas { height: 170px !important; width: 100%; }
 
             /* ── Visor de Señales ── */
@@ -1234,7 +1233,7 @@ def admin_panel(request: Request):
             </table>
         </div>
 
-        <!-- ══ SEÑALES EN VIVO ══ -->
+        <!-- ══ SEÑALES EN VIVO (SOLO ECG y ACELERACIÓN Z) ══ -->
         <div id="sec-vivo" class="section">
             <div class="vivo-header">
                 <h2>🟢 Monitoreo en Vivo — ESP32</h2>
@@ -1249,43 +1248,27 @@ def admin_panel(request: Request):
                 <span class="vivo-paciente-chip" id="vivo-paciente-chip">👤 —</span>
             </div>
 
-            <!-- Indicadores numéricos: ECG, SpO2, Acce Z, Flujo -->
+            <!-- Indicadores numéricos: solo ECG y Aceleración Z -->
             <div class="indicadores-vivo">
                 <div class="tarjeta-vivo" id="tv-ecg">
                     <div class="tv-label">ECG</div>
                     <div class="tv-val" id="val-ecg">--</div>
                     <div class="tv-unit">mV</div>
                 </div>
-                <div class="tarjeta-vivo" id="tv-spo2">
-                    <div class="tv-label">SpO₂</div>
-                    <div class="tv-val" id="val-spo2">--</div>
-                    <div class="tv-unit">%</div>
-                </div>
                 <div class="tarjeta-vivo" id="tv-accz">
                     <div class="tv-label">Aceleración Z</div>
                     <div class="tv-val" id="val-accz">--</div>
                     <div class="tv-unit">m/s²</div>
                 </div>
-                <div class="tarjeta-vivo" id="tv-flujo">
-                    <div class="tv-label">Flujo Resp.</div>
-                    <div class="tv-val" id="val-flujo">--</div>
-                    <div class="tv-unit">ADC</div>
-                </div>
             </div>
 
-            <!-- Gráficas 2×2 sin títulos y sin relleno -->
+            <!-- Gráficas 1x2: ECG y Aceleración Z -->
             <div class="charts-grid-vivo">
                 <div class="chart-card-vivo">
                     <canvas id="chartECG"></canvas>
                 </div>
                 <div class="chart-card-vivo">
-                    <canvas id="chartSPO2"></canvas>
-                </div>
-                <div class="chart-card-vivo">
                     <canvas id="chartACCZ"></canvas>
-                </div>
-                <div class="chart-card-vivo">
-                    <canvas id="chartFLUJO"></canvas>
                 </div>
             </div>
         </div>
@@ -1617,9 +1600,7 @@ def admin_panel(request: Request):
 
         // ════════════════════════════════════════════
         // SEÑALES EN VIVO — WebSocket + /stream
-        // El ESP32 hace POST a /stream cada 200 ms;
-        // la API difunde ese JSON por WS a /ws/browser.
-        // Formato recibido: { tipo:"stream", paciente, timestamp_ms, ecg, spo2, acce_z, flujo }
+        // Solo se muestran ECG y Aceleración Z
         // ════════════════════════════════════════════
         const MAX_PUNTOS = 150;   // ventana deslizante de 30 s a 200 ms/muestra
 
@@ -1631,7 +1612,7 @@ def admin_panel(request: Request):
                 maintainAspectRatio: false,
                 animation: false,
                 layout: {
-                    padding: { top: 2, bottom: 2, left: 2, right: 2 }  // reducir espacios internos
+                    padding: { top: 2, bottom: 2, left: 2, right: 2 }
                 },
                 plugins: {
                     legend: { display: false },
@@ -1668,15 +1649,12 @@ def admin_panel(request: Request):
             });
         }
 
-        // Inicializar las 4 gráficas en vivo (sin relleno, ECG con eje fijo -50..50)
+        // Inicializar solo ECG (eje fijo -50..50) y Aceleración Z (sin relleno)
         const chartVivo = {
             ecg:    crearChartVivo('chartECG',   '#E05C5C', 'mV', -50, 50, false),
-            spo2:   crearChartVivo('chartSPO2',  '#5C9AE0', '%',   null, null, false),
             acce_z: crearChartVivo('chartACCZ',  '#5CBE80', 'm/s²', null, null, false),
-            flujo:  crearChartVivo('chartFLUJO', '#E0A55C', 'ADC', null, null, false),
         };
 
-        // ── Agregar un punto a una gráfica, manteniendo ventana deslizante ────────
         function pushPunto(chart, label, valor) {
             chart.data.labels.push(label);
             chart.data.datasets[0].data.push(valor);
@@ -1684,24 +1662,10 @@ def admin_panel(request: Request):
                 chart.data.labels.shift();
                 chart.data.datasets[0].data.shift();
             }
-            chart.update('none');   // sin animación para máxima fluidez
+            chart.update('none');
         }
 
-        // ── Actualizar indicadores numéricos con color según umbral ───────────────
-        function actualizarIndicador(idVal, idCard, valor, unidad, umbralWarn, umbralCrit, invertir) {
-            const el = document.getElementById(idVal);
-            const card = document.getElementById(idCard);
-            if (el) el.textContent = typeof valor === 'number' ? valor.toFixed(unidad === '%' ? 0 : 1) : '--';
-            if (!card) return;
-            card.classList.remove('tv-warn', 'tv-crit');
-            if (valor === null) return;
-            const critico = invertir ? valor < umbralCrit : valor > umbralCrit;
-            const advertencia = invertir ? valor < umbralWarn : valor > umbralWarn;
-            if (critico)      card.classList.add('tv-crit');
-            else if (advertencia) card.classList.add('tv-warn');
-        }
-
-        // ── WebSocket al servidor ─────────────────────────────────────────────────
+        // WebSocket
         const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
         let ws;
 
@@ -1716,7 +1680,7 @@ def admin_panel(request: Request):
             ws.onclose = () => {
                 document.getElementById('ws-dot').className   = 'ws-dot off';
                 document.getElementById('ws-label').textContent = 'Sin conexión — reconectando...';
-                setTimeout(conectarWS, 3000);   // reconexión automática
+                setTimeout(conectarWS, 3000);
             };
 
             ws.onerror = () => ws.close();
@@ -1724,13 +1688,10 @@ def admin_panel(request: Request):
             ws.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
-
-                    // Solo procesar mensajes de tipo "stream" del ESP32
                     if (data.tipo !== 'stream') return;
 
                     const ts = new Date().toLocaleTimeString('es-MX', { hour12: false });
 
-                    // ── Chip de paciente ─────────────────────────────────────────
                     if (data.paciente) {
                         const wrap = document.getElementById('vivo-paciente-wrap');
                         const chip = document.getElementById('vivo-paciente-chip');
@@ -1738,32 +1699,17 @@ def admin_panel(request: Request):
                         chip.textContent = '👤 ' + data.paciente;
                     }
 
-                    // ── Estado WS activo ─────────────────────────────────────────
                     document.getElementById('ws-dot').className   = 'ws-dot on';
                     document.getElementById('ws-label').textContent = 'Transmitiendo en vivo';
 
-                    // ── ECG ───────────────────────────────────────────────────────
                     if (data.ecg !== undefined) {
                         pushPunto(chartVivo.ecg, ts, data.ecg);
                         document.getElementById('val-ecg').textContent = parseFloat(data.ecg).toFixed(1);
                     }
 
-                    // ── SpO2: crítico < 90, advertencia < 95 ─────────────────────
-                    if (data.spo2 !== undefined) {
-                        pushPunto(chartVivo.spo2, ts, data.spo2);
-                        actualizarIndicador('val-spo2', 'tv-spo2', data.spo2, '%', 95, 90, true);
-                    }
-
-                    // ── Aceleración Z ─────────────────────────────────────────────
                     if (data.acce_z !== undefined) {
                         pushPunto(chartVivo.acce_z, ts, data.acce_z);
                         document.getElementById('val-accz').textContent = parseFloat(data.acce_z).toFixed(3);
-                    }
-
-                    // ── Flujo respiratorio ────────────────────────────────────────
-                    if (data.flujo !== undefined) {
-                        pushPunto(chartVivo.flujo, ts, data.flujo);
-                        document.getElementById('val-flujo').textContent = parseInt(data.flujo);
                     }
 
                 } catch(e) {
@@ -1775,7 +1721,7 @@ def admin_panel(request: Request):
         conectarWS();
 
         // ════════════════════════════════════════════
-        // VISOR DE SEÑALES
+        // VISOR DE SEÑALES (sin cambios)
         // ════════════════════════════════════════════
         async function iniciarVisor() {
             const res = await fetch('/pacientes');
