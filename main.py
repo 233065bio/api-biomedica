@@ -809,6 +809,9 @@ async def subir_senales(senales: List[SenalESP32]):
         conn.close()
         return {"status": "success"}
     except Exception as e:
+        import traceback
+        print(f"[ERROR /senales] {e}
+{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/interrupciones")
@@ -1043,15 +1046,9 @@ async def subir_datos(datos: DatosESP32):
         conn.commit()
         interrupcion_id = cursor.lastrowid
 
-        timestamp_ms = int(hora_num * 3600000)
-        cursor.executemany(
-            "INSERT INTO senales_esp32 (interrupcion_id, tipo_senal, timestamp_ms, valor) VALUES (%s, %s, %s, %s)",
-            [
-                (interrupcion_id, "acce_z", timestamp_ms, datos.acce_z),
-                (interrupcion_id, "flujo",  timestamp_ms, datos.flujo),
-            ]
-        )
-        conn.commit()
+        # Las señales individuales llegan via POST /senales usando el interrupcion_id
+        # que se devuelve aquí. Insertar señales de resumen en este endpoint causaba
+        # timestamps duplicados/inválidos que generaban HTTP 500 en /senales-completas.
         cursor.close()
         conn.close()
 
@@ -1065,6 +1062,9 @@ async def subir_datos(datos: DatosESP32):
         }
 
     except Exception as e:
+        import traceback
+        print(f"[ERROR /subir-datos] {e}
+{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
