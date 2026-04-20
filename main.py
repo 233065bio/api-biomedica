@@ -11,13 +11,12 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://233065bio.github.io/AOS-monitoreo/",   # ← cambia esto por tu URL real
-    ],
+    allow_origins=["https://233065bio.github.io"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
@@ -821,7 +820,7 @@ async def subir_senales(senales: List[SenalESP32]):
         return {"status": "success"}
     except Exception as e:
         import traceback
-        print(f"[ERROR /senales] {e}
+        print(f"[ERROR /senales] {e}")
 {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
