@@ -820,8 +820,7 @@ async def subir_senales(senales: List[SenalESP32]):
         return {"status": "success"}
     except Exception as e:
         import traceback
-        print(f"[ERROR /senales] {e}")
-{traceback.format_exc()}")
+        print(f"[ERROR /senales] {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/interrupciones")
@@ -1073,8 +1072,7 @@ async def subir_datos(datos: DatosESP32):
 
     except Exception as e:
         import traceback
-        print(f"[ERROR /subir-datos] {e}
-{traceback.format_exc()}")
+        print(f"[ERROR /subir-datos] {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
