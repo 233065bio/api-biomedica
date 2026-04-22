@@ -110,6 +110,18 @@ def startup_event():
                 FOREIGN KEY (interrupcion_id) REFERENCES interrupciones(id)
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS estado_sensores (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                paciente VARCHAR(200),
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                hora VARCHAR(10),
+                bpm INT,
+                spo2 INT,
+                acce_z FLOAT,
+                flujo INT
+            )
+        """)
         cursor.execute("SELECT id FROM usuarios WHERE usuario = 'admin'")
         if not cursor.fetchone():
             hashed = hash_password("admin123")
@@ -170,6 +182,14 @@ class LoginRequest(BaseModel):
 
 class AnotacionModel(BaseModel):
     anotacion: str
+
+class EstadoSensoresModel(BaseModel):
+    paciente: str
+    hora: str
+    bpm: int
+    spo2: int
+    acce_z: float
+    flujo: int
 
 # ─────────────────────────────────────────────
 # HELPER: convertir timedelta a string HH:MM:SS
@@ -771,6 +791,47 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
 
 
 # ─────────────────────────────────────────────
+# ENDPOINTS ESTADO SENSORES (heartbeat 15 min)
+# ─────────────────────────────────────────────
+@app.post("/estado-sensores")
+async def recibir_estado_sensores(datos: EstadoSensoresModel):
+    """Recibe un heartbeat del ESP32 cada 15 minutos con lecturas de todos los sensores."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO estado_sensores (paciente, hora, bpm, spo2, acce_z, flujo) VALUES (%s, %s, %s, %s, %s, %s)",
+            (datos.paciente, datos.hora, datos.bpm, datos.spo2, datos.acce_z, datos.flujo)
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/estado-sensores")
+def obtener_estado_sensores(request: Request):
+    """Devuelve los últimos heartbeats recibidos, los más recientes primero."""
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM estado_sensores ORDER BY id DESC LIMIT 200")
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        result = []
+        for r in rows:
+            r = dict(r)
+            r["timestamp"] = str(r["timestamp"]) if r.get("timestamp") else None
+            result.append(r)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────
 # ENDPOINTS ESP32
 # ─────────────────────────────────────────────
 @app.get("/datos-sensores")
@@ -1172,6 +1233,7 @@ def admin_panel(request: Request):
             <div class="tab" onclick="cambiarTab('usuarios', event)">🔑 Usuarios</div>
             <div class="tab" onclick="cambiarTab('monitoreo', event)">📊 Monitoreo ESP32</div>
             <div class="tab" onclick="cambiarTab('senales', event)">📈 Visor de Señales</div>
+            <div class="tab" onclick="cambiarTab('estado', event)">🔋 Estado Sensores</div>
         </div>
         <div class="content">
             <!-- ══ PACIENTES ══ -->
@@ -1260,6 +1322,28 @@ def admin_panel(request: Request):
             </div>
         </div>
 
+            <!-- ══ ESTADO SENSORES ══ -->
+            <div id="sec-estado" class="section">
+                <div class="toolbar">
+                    <span style="font-size:13px; color:#5A7A8A;">Heartbeat de sensores — una lectura cada 15 minutos mientras el ESP32 monitorea</span>
+                    <button class="btn btn-primary" onclick="cargarEstado()">🔄 Actualizar</button>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Paciente</th>
+                            <th>Fecha/Hora (servidor)</th>
+                            <th>Hora ESP32</th>
+                            <th>BPM ❤️</th>
+                            <th>SpO₂ 🩸</th>
+                            <th>Acce Z</th>
+                            <th>Flujo</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tbody-estado"></tbody>
+                </table>
+            </div>
+
         <!-- MODAL PACIENTE -->
         <div class="modal-bg" id="modal-paciente">
             <div class="modal">
@@ -1344,6 +1428,7 @@ def admin_panel(request: Request):
                 if (tab === 'usuarios')  cargarUsuarios();
                 if (tab === 'monitoreo') cargarMonitoreo();
                 if (tab === 'senales')   iniciarVisor();
+                if (tab === 'estado')    cargarEstado();
             }
 
             // ══════════════════════════════════════════════
@@ -1944,6 +2029,33 @@ def admin_panel(request: Request):
                     })
                 });
                 cerrarModals(); cargarUsuarios(); mostrarToast('✅ Usuario creado');
+            }
+
+            // ══════════════════════════════════════════════
+            // ESTADO SENSORES (heartbeat 15 min)
+            // ══════════════════════════════════════════════
+            async function cargarEstado() {
+                const res = await fetch('/estado-sensores');
+                if (!res.ok) { mostrarToast('❌ Error al cargar estado'); return; }
+                const datos = await res.json();
+                const tb = document.getElementById('tbody-estado');
+                if (!datos.length) {
+                    tb.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#5A7A8A;padding:20px;">Sin registros aún. El ESP32 enviará el primer heartbeat a los 15 minutos de encendido.</td></tr>';
+                    return;
+                }
+                tb.innerHTML = datos.map(d => {
+                    const bpmClass = (d.bpm >= 60 && d.bpm <= 100) ? 'badge-ok' : 'badge-warn';
+                    const spo2Class = d.spo2 < 90 ? 'badge-crit' : d.spo2 < 95 ? 'badge-warn' : 'badge-ok';
+                    return `<tr>
+                        <td><strong>${d.paciente}</strong></td>
+                        <td style="font-size:12px;">${d.timestamp || '--'}</td>
+                        <td>${d.hora || '--'}</td>
+                        <td><span class="badge ${bpmClass}">${d.bpm} lpm</span></td>
+                        <td><span class="badge ${spo2Class}">${d.spo2}%</span></td>
+                        <td>${parseFloat(d.acce_z).toFixed(2)}</td>
+                        <td>${d.flujo}</td>
+                    </tr>`;
+                }).join('');
             }
 
             window.onload = cargarPacientes;
