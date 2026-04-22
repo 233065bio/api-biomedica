@@ -6,11 +6,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import mysql.connector
 import os
 import bcrypt
-import json
-import ssl
-import threading
-import paho.mqtt.client as mqtt_lib
-from datetime import date, datetime
 
 app = FastAPI()
 
@@ -22,28 +17,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
 
-# ─────────────────────────────────────────────
-# CONFIGURACIÓN MQTT (HiveMQ Cloud)
-# ─────────────────────────────────────────────
-MQTT_BROKER   = os.getenv("MQTT_BROKER",   "c6feca18f15f430a8b4ffd671e2c74f7.s1.eu.hivemq.cloud")          # e.g. xxxxxx.s1.eu.hivemq.cloud
-MQTT_PORT     = int(os.getenv("MQTT_PORT_BROKER", "8883"))
-MQTT_USER_M   = os.getenv("MQTT_USER_MQTT", "carolina")
-MQTT_PASS_M   = os.getenv("MQTT_PASS_MQTT", "Carolina23.")
-
-TOPIC_RESUMEN = "biomedica/resumen"
-TOPIC_SENALES = "biomedica/senales"
-TOPIC_MONITOR = "biomedica/monitor"
-
-# Cache en memoria: clave (paciente, hora) → interrupcion_id
-# Permite que biomedica/senales encuentre la interrupción recién creada por biomedica/resumen
-_interrupcion_cache: dict = {}
-
-# ─────────────────────────────────────────────
-# DB
-# ─────────────────────────────────────────────
 def get_db_connection():
     return mysql.connector.connect(
         host=os.getenv("MYSQL_HOST"),
@@ -146,273 +123,6 @@ def startup_event():
         print("✅ Tablas verificadas/creadas con éxito")
     except Exception as e:
         print(f"❌ Error al crear tablas: {e}")
-
-    # Iniciar suscriptor MQTT en hilo background
-    if MQTT_BROKER:
-        _iniciar_mqtt_subscriber()
-    else:
-        print("⚠️  MQTT_BROKER no configurado — suscriptor MQTT desactivado.")
-
-# ─────────────────────────────────────────────
-# MQTT SUBSCRIBER
-# ─────────────────────────────────────────────
-
-def _fecha_esp32_a_mysql(fecha_str: str) -> Optional[str]:
-    """Convierte 'DD/MM/YYYY' → 'YYYY-MM-DD'. Retorna hoy si el formato falla."""
-    try:
-        dt = datetime.strptime(fecha_str, "%d/%m/%Y")
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return date.today().isoformat()
-
-
-def _procesar_resumen(payload: dict):
-    """
-    Recibe el JSON de biomedica/resumen y crea/actualiza las filas en DB
-    exactamente igual que el endpoint /subir-datos.
-    """
-    global _interrupcion_cache
-    try:
-        nombre_paciente = payload.get("paciente", "Desconocido")
-        hora_str        = payload.get("hora", "00:00:00")        # "HH:MM:SS"
-        fecha_raw       = payload.get("fecha", "")
-        spo2            = float(payload.get("spo2",    0))
-        bpm             = float(payload.get("bpm",     0))       # frecuencia cardiaca
-        acce_z          = float(payload.get("acce_z",  0))
-        flujo           = float(payload.get("flujo",   0))
-        no_apnea        = int(payload.get("no_apnea",  1))
-        duracion        = float(payload.get("duracion", 0))
-
-        fecha_mysql = _fecha_esp32_a_mysql(fecha_raw) if fecha_raw and fecha_raw != "SIN_FECHA" \
-                      else date.today().isoformat()
-
-        conn   = get_db_connection()
-        cursor = conn.cursor()
-
-        # ── Paciente ──────────────────────────────────────────────────────────
-        cursor.execute("SELECT id FROM pacientes WHERE nombre = %s LIMIT 1", (nombre_paciente,))
-        fila = cursor.fetchone()
-        if fila:
-            paciente_id = fila[0]
-        else:
-            cursor.execute(
-                "INSERT INTO pacientes (nombre, fecha_estudio) VALUES (%s, %s)",
-                (nombre_paciente, fecha_mysql)
-            )
-            conn.commit()
-            paciente_id = cursor.lastrowid
-
-        # ── Sesión (una por día por paciente) ─────────────────────────────────
-        cursor.execute(
-            "SELECT id FROM sesiones WHERE paciente_id = %s AND DATE(fecha) = CURDATE() LIMIT 1",
-            (paciente_id,)
-        )
-        fila = cursor.fetchone()
-        if fila:
-            sesion_id = fila[0]
-        else:
-            cursor.execute("INSERT INTO sesiones (paciente_id) VALUES (%s)", (paciente_id,))
-            conn.commit()
-            sesion_id = cursor.lastrowid
-
-        # ── Hora de sesión ────────────────────────────────────────────────────
-        partes   = hora_str.split(":")
-        hora_num = int(partes[0]) if partes else 0
-        hora_ini = f"{hora_num:02d}:00:00"
-        hora_fin = f"{(hora_num + 1) % 24:02d}:00:00"
-
-        cursor.execute(
-            "SELECT id FROM horas_sesion WHERE sesion_id = %s AND numero_hora = %s LIMIT 1",
-            (sesion_id, hora_num)
-        )
-        fila = cursor.fetchone()
-        if fila:
-            hora_sesion_id = fila[0]
-        else:
-            cursor.execute(
-                "INSERT INTO horas_sesion (sesion_id, numero_hora, hora_inicio, hora_fin) VALUES (%s, %s, %s, %s)",
-                (sesion_id, hora_num, hora_ini, hora_fin)
-            )
-            conn.commit()
-            hora_sesion_id = cursor.lastrowid
-
-        # ── Número consecutivo de interrupción ────────────────────────────────
-        cursor.execute("""
-            SELECT COUNT(i.id) as total
-            FROM interrupciones i
-            JOIN horas_sesion hs ON i.hora_sesion_id = hs.id
-            WHERE hs.sesion_id = %s
-        """, (sesion_id,))
-        conteo = cursor.fetchone()
-        numero_consecutivo = (conteo[0] if conteo else 0) + 1
-
-        # ── Interrupción ──────────────────────────────────────────────────────
-        cursor.execute("""
-            INSERT INTO interrupciones
-                (hora_sesion_id, numero_interrupcion, hora_detectada,
-                 duracion_segundos, spo2, frecuencia_cardiaca)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (hora_sesion_id, numero_consecutivo, hora_str, duracion, spo2, bpm))
-        conn.commit()
-        interrupcion_id = cursor.lastrowid
-
-        cursor.close()
-        conn.close()
-
-        # Guardar en cache para que biomedica/senales lo encuentre
-        cache_key = (nombre_paciente, hora_str)
-        _interrupcion_cache[cache_key] = interrupcion_id
-        # También guardar por (paciente, hora_sin_segundos) por si hay diferencia de segundos
-        hora_hhmm = hora_str[:5]
-        _interrupcion_cache[(nombre_paciente, hora_hhmm)] = interrupcion_id
-
-        print(f"[MQTT/resumen] ✅ Apnea #{numero_consecutivo} registrada → interrupcion_id={interrupcion_id} paciente={nombre_paciente}")
-
-    except Exception as e:
-        import traceback
-        print(f"[MQTT/resumen] ❌ Error: {e}\n{traceback.format_exc()}")
-
-
-def _procesar_senales(payload_list: list):
-    """
-    Recibe el array JSON de biomedica/senales y lo inserta en senales_esp32.
-    Usa el cache para encontrar interrupcion_id; si no está, busca en DB.
-    """
-    global _interrupcion_cache
-    if not payload_list:
-        return
-    try:
-        # Obtener paciente y apnea_hora del primer elemento
-        primer = payload_list[0]
-        nombre_paciente = primer.get("paciente", "")
-        apnea_hora      = primer.get("apnea_hora", "")  # "HH:MM:SS"
-
-        interrupcion_id = _interrupcion_cache.get((nombre_paciente, apnea_hora))
-
-        # Fallback: buscar en DB la interrupción más reciente para este paciente/hora
-        if not interrupcion_id:
-            hora_hhmm = apnea_hora[:5]
-            interrupcion_id = _interrupcion_cache.get((nombre_paciente, hora_hhmm))
-
-        if not interrupcion_id:
-            conn   = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT i.id FROM interrupciones i
-                JOIN horas_sesion hs ON i.hora_sesion_id = hs.id
-                JOIN sesiones s ON hs.sesion_id = s.id
-                JOIN pacientes p ON s.paciente_id = p.id
-                WHERE p.nombre = %s
-                  AND TIME_FORMAT(i.hora_detectada, '%%H:%%i') = %s
-                ORDER BY i.id DESC LIMIT 1
-            """, (nombre_paciente, apnea_hora[:5]))
-            fila = cursor.fetchone()
-            cursor.close()
-            conn.close()
-            if fila:
-                interrupcion_id = fila[0]
-                _interrupcion_cache[(nombre_paciente, apnea_hora)] = interrupcion_id
-            else:
-                print(f"[MQTT/senales] ⚠️  No se encontró interrupcion_id para ({nombre_paciente}, {apnea_hora}) — lote descartado.")
-                return
-
-        conn   = get_db_connection()
-        cursor = conn.cursor()
-
-        rows = []
-        for m in payload_list:
-            ts  = int(m.get("ts",     0))
-            ecg = float(m.get("ecg",  0))
-            sp2 = float(m.get("spo2", 0))
-            az  = float(m.get("acce_z", 0))
-            fl  = float(m.get("flujo",  0))
-            rows.append((interrupcion_id, "ecg",    ts, ecg))
-            rows.append((interrupcion_id, "spo2",   ts, sp2))
-            rows.append((interrupcion_id, "acce_z", ts, az))
-            rows.append((interrupcion_id, "flujo",  ts, fl))
-
-        cursor.executemany(
-            "INSERT INTO senales_esp32 (interrupcion_id, tipo_senal, timestamp_ms, valor) VALUES (%s,%s,%s,%s)",
-            rows
-        )
-        conn.commit()
-        cursor.close()
-        conn.close()
-        print(f"[MQTT/senales] ✅ {len(payload_list)} muestras → interrupcion_id={interrupcion_id}")
-
-    except Exception as e:
-        import traceback
-        print(f"[MQTT/senales] ❌ Error: {e}\n{traceback.format_exc()}")
-
-
-def _procesar_monitor(payload: dict):
-    """Recibe promedios cada 15 min — solo se loguean por ahora (no requieren tabla nueva)."""
-    print(
-        f"[MQTT/monitor] 📊 {payload.get('paciente')} | "
-        f"SpO2={payload.get('spo2_prom')} | "
-        f"BPM={payload.get('bpm_prom')} | "
-        f"muestras={payload.get('muestras')}"
-    )
-
-
-def _on_mqtt_connect(client, userdata, flags, rc):
-    if rc == 0:
-        print("[MQTT] ✅ Conectado al broker HiveMQ Cloud.")
-        client.subscribe(TOPIC_RESUMEN)
-        client.subscribe(TOPIC_SENALES)
-        client.subscribe(TOPIC_MONITOR)
-        print(f"[MQTT] Suscrito a: {TOPIC_RESUMEN}, {TOPIC_SENALES}, {TOPIC_MONITOR}")
-    else:
-        print(f"[MQTT] ❌ Error de conexión: código {rc}")
-
-
-def _on_mqtt_message(client, userdata, msg):
-    topic   = msg.topic
-    payload = msg.payload.decode("utf-8", errors="replace")
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError as e:
-        print(f"[MQTT] ❌ JSON inválido en {topic}: {e}")
-        return
-
-    if topic == TOPIC_RESUMEN:
-        _procesar_resumen(data)
-    elif topic == TOPIC_SENALES:
-        lista = data if isinstance(data, list) else [data]
-        _procesar_senales(lista)
-    elif topic == TOPIC_MONITOR:
-        _procesar_monitor(data)
-
-
-def _on_mqtt_disconnect(client, userdata, rc):
-    if rc != 0:
-        print(f"[MQTT] ⚠️  Desconectado inesperadamente (rc={rc}). Reconectando automáticamente...")
-
-
-def _iniciar_mqtt_subscriber():
-    """Lanza el cliente MQTT en un hilo daemon."""
-    def _run():
-        client = mqtt_lib.Client(client_id="FastAPI_AOS_Subscriber", clean_session=True)
-        client.username_pw_set(MQTT_USER_M, MQTT_PASS_M)
-
-        # TLS sin verificación de certificado (compatible con HiveMQ Cloud gratuito)
-        client.tls_set(cert_reqs=ssl.CERT_NONE)
-        client.tls_insecure_set(True)
-
-        client.on_connect    = _on_mqtt_connect
-        client.on_message    = _on_mqtt_message
-        client.on_disconnect = _on_mqtt_disconnect
-
-        try:
-            client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-            client.loop_forever()   # bloquea el hilo; reconecta automáticamente
-        except Exception as e:
-            print(f"[MQTT] ❌ No se pudo conectar al broker: {e}")
-
-    hilo = threading.Thread(target=_run, daemon=True, name="mqtt-subscriber")
-    hilo.start()
-    print(f"[MQTT] Hilo suscriptor iniciado → {MQTT_BROKER}:{MQTT_PORT}")
-
 
 # ─────────────────────────────────────────────
 # MODELOS
@@ -576,18 +286,6 @@ def logout():
     return response
 
 # ─────────────────────────────────────────────
-# ENDPOINT DE ESTADO MQTT (útil para depuración)
-# ─────────────────────────────────────────────
-@app.get("/mqtt-status")
-def mqtt_status():
-    return {
-        "broker":   MQTT_BROKER,
-        "port":     MQTT_PORT,
-        "topics":   [TOPIC_RESUMEN, TOPIC_SENALES, TOPIC_MONITOR],
-        "cache_keys": list(_interrupcion_cache.keys())[-20:]  # últimas 20 entradas
-    }
-
-# ─────────────────────────────────────────────
 # ENDPOINTS SESIONES
 # ─────────────────────────────────────────────
 @app.get("/sesion/por-paciente/{paciente_id}")
@@ -648,6 +346,9 @@ def sesiones_por_paciente(paciente_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─────────────────────────────────────────────
+# ELIMINAR SESIÓN (en cascada: horas → interrupciones → señales)
+# ─────────────────────────────────────────────
 @app.delete("/sesiones/{sesion_id}")
 def eliminar_sesion(sesion_id: int, request: Request):
     if not verificar_sesion(request):
@@ -655,16 +356,29 @@ def eliminar_sesion(sesion_id: int, request: Request):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+
+        # 1. Obtener todas las horas de esta sesión
         cursor.execute("SELECT id FROM horas_sesion WHERE sesion_id = %s", (sesion_id,))
         horas = [r[0] for r in cursor.fetchall()]
+
         for hora_id in horas:
+            # 2. Obtener interrupciones de cada hora
             cursor.execute("SELECT id FROM interrupciones WHERE hora_sesion_id = %s", (hora_id,))
             interrupciones = [r[0] for r in cursor.fetchall()]
+
+            # 3. Eliminar señales de cada interrupción
             for interr_id in interrupciones:
                 cursor.execute("DELETE FROM senales_esp32 WHERE interrupcion_id = %s", (interr_id,))
+
+            # 4. Eliminar interrupciones de esta hora
             cursor.execute("DELETE FROM interrupciones WHERE hora_sesion_id = %s", (hora_id,))
+
+        # 5. Eliminar horas de la sesión
         cursor.execute("DELETE FROM horas_sesion WHERE sesion_id = %s", (sesion_id,))
+
+        # 6. Eliminar la sesión
         cursor.execute("DELETE FROM sesiones WHERE id = %s", (sesion_id,))
+
         conn.commit()
         cursor.close()
         conn.close()
@@ -672,6 +386,9 @@ def eliminar_sesion(sesion_id: int, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─────────────────────────────────────────────
+# ELIMINAR HORA DE SESIÓN (en cascada: interrupciones → señales)
+# ─────────────────────────────────────────────
 @app.delete("/horas-sesion/{hora_sesion_id}")
 def eliminar_hora_sesion(hora_sesion_id: int, request: Request):
     if not verificar_sesion(request):
@@ -679,12 +396,21 @@ def eliminar_hora_sesion(hora_sesion_id: int, request: Request):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+
+        # 1. Obtener interrupciones de esta hora
         cursor.execute("SELECT id FROM interrupciones WHERE hora_sesion_id = %s", (hora_sesion_id,))
         interrupciones = [r[0] for r in cursor.fetchall()]
+
+        # 2. Eliminar señales de cada interrupción
         for interr_id in interrupciones:
             cursor.execute("DELETE FROM senales_esp32 WHERE interrupcion_id = %s", (interr_id,))
+
+        # 3. Eliminar interrupciones
         cursor.execute("DELETE FROM interrupciones WHERE hora_sesion_id = %s", (hora_sesion_id,))
+
+        # 4. Eliminar la hora
         cursor.execute("DELETE FROM horas_sesion WHERE id = %s", (hora_sesion_id,))
+
         conn.commit()
         cursor.close()
         conn.close()
@@ -712,6 +438,7 @@ def horas_sesion_endpoint(sesion_id: int):
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
+
         result = []
         for idx, r in enumerate(rows):
             r = dict(r)
@@ -732,8 +459,12 @@ def interrupciones_por_hora(hora_sesion_id: int):
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT sesion_id FROM horas_sesion WHERE id = %s", (hora_sesion_id,))
+
+        cursor.execute("""
+            SELECT sesion_id FROM horas_sesion WHERE id = %s
+        """, (hora_sesion_id,))
         sesion_row = cursor.fetchone()
+
         cursor.execute("""
             SELECT id, numero_interrupcion, hora_detectada,
                    duracion_segundos, spo2, frecuencia_cardiaca, anotacion
@@ -742,6 +473,7 @@ def interrupciones_por_hora(hora_sesion_id: int):
             ORDER BY id
         """, (hora_sesion_id,))
         rows = cursor.fetchall()
+
         offset = 0
         if sesion_row:
             sesion_id = sesion_row["sesion_id"]
@@ -754,8 +486,10 @@ def interrupciones_por_hora(hora_sesion_id: int):
             offset_row = cursor.fetchone()
             if offset_row:
                 offset = offset_row["cnt"]
+
         cursor.close()
         conn.close()
+
         result = []
         for local_idx, r in enumerate(rows):
             r = dict(r)
@@ -782,6 +516,7 @@ def interrupciones_por_sesion(sesion_id: int):
             ORDER BY i.id
         """, (sesion_id,))
         rows = cursor.fetchall()
+
         cursor.execute("""
             SELECT hs.id as hs_id, hs.numero_hora,
                    ROW_NUMBER() OVER (ORDER BY hs.numero_hora) AS hora_orden
@@ -792,8 +527,10 @@ def interrupciones_por_sesion(sesion_id: int):
         hora_orden_map = {}
         for h in horas_info:
             hora_orden_map[h["hs_id"]] = h["hora_orden"]
+
         cursor.close()
         conn.close()
+
         result = []
         for global_idx, r in enumerate(rows):
             r = dict(r)
@@ -820,6 +557,9 @@ async def guardar_anotacion_endpoint(interrupcion_id: int, body: AnotacionModel)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─────────────────────────────────────────────
+# ELIMINAR INTERRUPCIÓN (señales en cascada)
+# ─────────────────────────────────────────────
 @app.delete("/interrupciones/{interrupcion_id}")
 def eliminar_interrupcion(interrupcion_id: int):
     try:
@@ -857,6 +597,7 @@ def senales_por_interrupcion(interrupcion_id: int, tipo: str):
 
 @app.get("/senales-completas/{interrupcion_id}")
 def senales_completas(interrupcion_id: int):
+    """Devuelve todas las señales agrupadas por tipo, con limpieza de outliers."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
@@ -869,6 +610,7 @@ def senales_completas(interrupcion_id: int):
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
+
         raw = {}
         for r in rows:
             tipo = r["tipo_senal"]
@@ -876,6 +618,7 @@ def senales_completas(interrupcion_id: int):
                 raw[tipo] = {"timestamps": [], "valores": []}
             raw[tipo]["timestamps"].append(r["timestamp_ms"])
             raw[tipo]["valores"].append(float(r["valor"]))
+
         resultado = {}
         for tipo, data in raw.items():
             ts = data["timestamps"]
@@ -883,12 +626,20 @@ def senales_completas(interrupcion_id: int):
             if tipo.lower() == "ecg":
                 ts, vs = _limpiar_outliers_ecg(ts, vs)
             resultado[tipo] = {"timestamps": ts, "valores": vs}
+
         ts_flujo = raw.get("flujo",  {}).get("timestamps", [])
         vs_flujo = raw.get("flujo",  {}).get("valores",    [])
         ts_accz  = raw.get("acce_z", {}).get("timestamps", [])
         vs_accz  = raw.get("acce_z", {}).get("valores",    [])
-        ts_resp, vs_resp = _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz)
-        resultado["frecuencia_respiratoria"] = {"timestamps": ts_resp, "valores": vs_resp}
+
+        ts_resp, vs_resp = _construir_resp_desde_streaming(
+            ts_flujo, vs_flujo, ts_accz, vs_accz
+        )
+        resultado["frecuencia_respiratoria"] = {
+            "timestamps": ts_resp,
+            "valores":    vs_resp
+        }
+
         return resultado
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -914,6 +665,19 @@ def _limpiar_outliers_ecg(timestamps, valores):
 import math as _math
 
 def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
+    def media_movil_gauss(valores, ventana):
+        if len(valores) <= ventana:
+            return valores[:]
+        result = valores[:]
+        for _ in range(3):
+            nuevo = []
+            for i in range(len(result)):
+                inicio = max(0, i - ventana // 2)
+                fin = min(len(result), i + ventana // 2 + 1)
+                nuevo.append(sum(result[inicio:fin]) / (fin - inicio))
+            result = nuevo
+        return result
+
     def interpolar_uniforme(ts, vs, n=500):
         if len(ts) < 2:
             return ts[:], vs[:]
@@ -982,27 +746,32 @@ def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
         duracion = t_global_max - t_global_min
         if duracion <= 0:
             duracion = 20000
+
         N = 500
         paso = duracion / (N - 1)
         ts_u = [int(t_global_min + i * paso) for i in range(N)]
+
         vs_flujo_i = interp_en_ts(ts_flujo, vs_flujo, ts_u)
         vs_accz_i  = interp_en_ts(ts_accz,  vs_accz,  ts_u)
+
         f_min = min(vs_flujo_i)
         f_max = max(vs_flujo_i)
+
         vs_accz_norm = normalizar_al_rango(vs_accz_i, f_min, f_max)
         vs_comb = [0.70 * f + 0.30 * a for f, a in zip(vs_flujo_i, vs_accz_norm)]
+
         t0 = ts_u[0]
         return [t - t0 for t in ts_u], [round(v, 3) for v in vs_comb]
 
-    duracion_ms = 20000
-    N = 500
-    ts_out = [int(i * duracion_ms / (N - 1)) for i in range(N)]
-    vs_out = [round(155 + 30 * _math.sin(2 * _math.pi * 0.25 * t / 1000.0), 3) for t in ts_out]
-    return ts_out, vs_out
+        duracion_ms = 20000  # 20 segundos por defecto
+        N = 500
+        ts_out = [int(i * duracion_ms / (N - 1)) for i in range(N)]
+        vs_out = [round(155 + 30 * _math.sin(2 * _math.pi * 0.25 * t / 1000.0), 3) for t in ts_out]
+        return ts_out, vs_out
 
 
 # ─────────────────────────────────────────────
-# ENDPOINTS ESP32 (HTTP — se mantienen por compatibilidad)
+# ENDPOINTS ESP32
 # ─────────────────────────────────────────────
 @app.get("/datos-sensores")
 def obtener_datos_sensores(request: Request):
@@ -1011,7 +780,7 @@ def obtener_datos_sensores(request: Request):
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
+        query = """
             SELECT
                 p.nombre AS paciente_nombre,
                 i.hora_detectada, i.spo2, i.frecuencia_cardiaca AS ecg,
@@ -1023,7 +792,8 @@ def obtener_datos_sensores(request: Request):
             JOIN sesiones s ON hs.sesion_id = s.id
             JOIN pacientes p ON s.paciente_id = p.id
             ORDER BY i.id DESC
-        """)
+        """
+        cursor.execute(query)
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
@@ -1069,82 +839,6 @@ async def crear_interrupcion(data: InterrupcionModel):
         conn.close()
         return {"status": "success", "id": new_id}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/subir-datos")
-async def subir_datos(datos: DatosESP32):
-    """Endpoint HTTP legacy — se mantiene por compatibilidad."""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM pacientes WHERE nombre = %s LIMIT 1", (datos.paciente,))
-        fila = cursor.fetchone()
-        if fila:
-            paciente_id = fila[0]
-        else:
-            cursor.execute(
-                "INSERT INTO pacientes (nombre, fecha_estudio) VALUES (%s, %s)",
-                (datos.paciente, date.today().isoformat())
-            )
-            conn.commit()
-            paciente_id = cursor.lastrowid
-        cursor.execute(
-            "SELECT id FROM sesiones WHERE paciente_id = %s AND DATE(fecha) = CURDATE() LIMIT 1",
-            (paciente_id,)
-        )
-        fila = cursor.fetchone()
-        if fila:
-            sesion_id = fila[0]
-        else:
-            cursor.execute("INSERT INTO sesiones (paciente_id) VALUES (%s)", (paciente_id,))
-            conn.commit()
-            sesion_id = cursor.lastrowid
-        partes   = datos.hora.split(":")
-        hora_num = int(partes[0])
-        hora_ini = f"{hora_num:02d}:00:00"
-        hora_fin = f"{(hora_num + 1) % 24:02d}:00:00"
-        cursor.execute(
-            "SELECT id FROM horas_sesion WHERE sesion_id = %s AND numero_hora = %s LIMIT 1",
-            (sesion_id, hora_num)
-        )
-        fila = cursor.fetchone()
-        if fila:
-            hora_sesion_id = fila[0]
-        else:
-            cursor.execute(
-                "INSERT INTO horas_sesion (sesion_id, numero_hora, hora_inicio, hora_fin) VALUES (%s, %s, %s, %s)",
-                (sesion_id, hora_num, hora_ini, hora_fin)
-            )
-            conn.commit()
-            hora_sesion_id = cursor.lastrowid
-        cursor.execute("""
-            SELECT COUNT(i.id) as total
-            FROM interrupciones i
-            JOIN horas_sesion hs ON i.hora_sesion_id = hs.id
-            WHERE hs.sesion_id = %s
-        """, (sesion_id,))
-        conteo = cursor.fetchone()
-        numero_consecutivo = (conteo[0] if conteo else 0) + 1
-        cursor.execute("""
-            INSERT INTO interrupciones
-                (hora_sesion_id, numero_interrupcion, hora_detectada, duracion_segundos, spo2, frecuencia_cardiaca)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (hora_sesion_id, numero_consecutivo, datos.hora, datos.duracion, datos.spo2, datos.ecg))
-        conn.commit()
-        interrupcion_id = cursor.lastrowid
-        cursor.close()
-        conn.close()
-        return {
-            "status": "success",
-            "paciente_id":        paciente_id,
-            "sesion_id":          sesion_id,
-            "hora_sesion_id":     hora_sesion_id,
-            "interrupcion_id":    interrupcion_id,
-            "numero_consecutivo": numero_consecutivo
-        }
-    except Exception as e:
-        import traceback
-        print(f"[ERROR /subir-datos] {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────
@@ -1196,6 +890,9 @@ def editar_paciente(paciente_id: int, data: PacienteModel, request: Request):
     conn.close()
     return {"status": "success"}
 
+# ─────────────────────────────────────────────
+# ELIMINAR PACIENTE (en cascada: sesiones → horas → interrupciones → señales)
+# ─────────────────────────────────────────────
 @app.delete("/pacientes/{paciente_id}")
 def eliminar_paciente(paciente_id: int, request: Request):
     if not verificar_sesion(request):
@@ -1203,20 +900,37 @@ def eliminar_paciente(paciente_id: int, request: Request):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+
+        # 1. Obtener todas las sesiones del paciente
         cursor.execute("SELECT id FROM sesiones WHERE paciente_id = %s", (paciente_id,))
         sesiones = [r[0] for r in cursor.fetchall()]
+
         for sesion_id in sesiones:
+            # 2. Obtener horas de cada sesión
             cursor.execute("SELECT id FROM horas_sesion WHERE sesion_id = %s", (sesion_id,))
             horas = [r[0] for r in cursor.fetchall()]
+
             for hora_id in horas:
+                # 3. Obtener interrupciones de cada hora
                 cursor.execute("SELECT id FROM interrupciones WHERE hora_sesion_id = %s", (hora_id,))
                 interrupciones = [r[0] for r in cursor.fetchall()]
+
+                # 4. Eliminar señales de cada interrupción
                 for interr_id in interrupciones:
                     cursor.execute("DELETE FROM senales_esp32 WHERE interrupcion_id = %s", (interr_id,))
+
+                # 5. Eliminar interrupciones
                 cursor.execute("DELETE FROM interrupciones WHERE hora_sesion_id = %s", (hora_id,))
+
+            # 6. Eliminar horas
             cursor.execute("DELETE FROM horas_sesion WHERE sesion_id = %s", (sesion_id,))
+
+        # 7. Eliminar sesiones
         cursor.execute("DELETE FROM sesiones WHERE paciente_id = %s", (paciente_id,))
+
+        # 8. Eliminar el paciente
         cursor.execute("DELETE FROM pacientes WHERE id = %s", (paciente_id,))
+
         conn.commit()
         cursor.close()
         conn.close()
@@ -1267,8 +981,102 @@ def eliminar_usuario(usuario_id: int, request: Request):
     conn.close()
     return {"status": "success"}
 
+async def guardar_usuario():
+    pass  # handled above
+
 # ─────────────────────────────────────────────
-# PANEL ADMIN (sin cambios respecto al original)
+# ENDPOINT ESP32 — RECEPCIÓN UNIFICADA
+# ─────────────────────────────────────────────
+@app.post("/subir-datos")
+async def subir_datos(datos: DatosESP32):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT id FROM pacientes WHERE nombre = %s LIMIT 1", (datos.paciente,))
+        fila = cursor.fetchone()
+        if fila:
+            paciente_id = fila[0]
+        else:
+            from datetime import date
+            cursor.execute(
+                "INSERT INTO pacientes (nombre, fecha_estudio) VALUES (%s, %s)",
+                (datos.paciente, date.today().isoformat())
+            )
+            conn.commit()
+            paciente_id = cursor.lastrowid
+
+        cursor.execute(
+            "SELECT id FROM sesiones WHERE paciente_id = %s AND DATE(fecha) = CURDATE() LIMIT 1",
+            (paciente_id,)
+        )
+        fila = cursor.fetchone()
+        if fila:
+            sesion_id = fila[0]
+        else:
+            cursor.execute("INSERT INTO sesiones (paciente_id) VALUES (%s)", (paciente_id,))
+            conn.commit()
+            sesion_id = cursor.lastrowid
+
+        partes   = datos.hora.split(":")
+        hora_num = int(partes[0])
+        hora_ini = f"{hora_num:02d}:00:00"
+        hora_fin = f"{(hora_num + 1) % 24:02d}:00:00"
+
+        cursor.execute(
+            "SELECT id FROM horas_sesion WHERE sesion_id = %s AND numero_hora = %s LIMIT 1",
+            (sesion_id, hora_num)
+        )
+        fila = cursor.fetchone()
+        if fila:
+            hora_sesion_id = fila[0]
+        else:
+            cursor.execute(
+                "INSERT INTO horas_sesion (sesion_id, numero_hora, hora_inicio, hora_fin) VALUES (%s, %s, %s, %s)",
+                (sesion_id, hora_num, hora_ini, hora_fin)
+            )
+            conn.commit()
+            hora_sesion_id = cursor.lastrowid
+
+        cursor.execute("""
+            SELECT COUNT(i.id) as total
+            FROM interrupciones i
+            JOIN horas_sesion hs ON i.hora_sesion_id = hs.id
+            WHERE hs.sesion_id = %s
+        """, (sesion_id,))
+        conteo = cursor.fetchone()
+        numero_consecutivo = (conteo[0] if conteo else 0) + 1
+
+        cursor.execute("""
+            INSERT INTO interrupciones
+                (hora_sesion_id, numero_interrupcion, hora_detectada, duracion_segundos, spo2, frecuencia_cardiaca)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (hora_sesion_id, numero_consecutivo, datos.hora, datos.duracion, datos.spo2, datos.ecg))
+        conn.commit()
+        interrupcion_id = cursor.lastrowid
+
+        # Las señales individuales llegan via POST /senales usando el interrupcion_id
+        # que se devuelve aquí. Insertar señales de resumen en este endpoint causaba
+        # timestamps duplicados/inválidos que generaban HTTP 500 en /senales-completas.
+        cursor.close()
+        conn.close()
+
+        return {
+            "status": "success",
+            "paciente_id":         paciente_id,
+            "sesion_id":           sesion_id,
+            "hora_sesion_id":      hora_sesion_id,
+            "interrupcion_id":     interrupcion_id,
+            "numero_consecutivo":  numero_consecutivo
+        }
+
+    except Exception as e:
+        import traceback
+        print(f"[ERROR /subir-datos] {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────
+# PANEL ADMIN
 # ─────────────────────────────────────────────
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel(request: Request):
@@ -1342,10 +1150,12 @@ def admin_panel(request: Request):
             .tab-signal[data-tipo="flujo"].active  { background: #E0A55C; border-color: #E0A55C; }
             .loading-msg { text-align:center; color:#7AAFC5; padding:40px; font-size:13px; }
             .fc-badge { background: #EEF8F2; color: #2E7D52; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
+            /* Modal de confirmación de eliminación */
             .modal-confirm { background: white; border-radius: 8px; padding: 28px; width: 400px; text-align: center; }
             .modal-confirm h3 { color: #2C4A5A; margin-bottom: 10px; }
             .modal-confirm p { color: #5A7A8A; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
             .modal-confirm .btn-row { display: flex; gap: 10px; justify-content: center; }
+            /* Selector de sesión en visor con botón borrar */
             .sel-row { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; }
             .sel-row select { flex: 1; margin-bottom: 0; }
             .btn-del-sm { background: #D65C5C; color: white; border: none; border-radius: 4px; padding: 7px 10px; cursor: pointer; font-size: 13px; flex-shrink: 0; }
@@ -1364,16 +1174,21 @@ def admin_panel(request: Request):
             <div class="tab" onclick="cambiarTab('senales', event)">📈 Visor de Señales</div>
         </div>
         <div class="content">
+            <!-- ══ PACIENTES ══ -->
             <div id="sec-pacientes" class="section active">
                 <div class="toolbar">
                     <input class="search" id="buscar-pac" placeholder="🔍 Buscar paciente..." oninput="filtrarPacientes()">
                     <button class="btn btn-primary" onclick="abrirModalPaciente()">+ Nuevo paciente</button>
                 </div>
                 <table>
-                    <thead><tr><th>Nombre</th><th>Fecha estudio</th><th>Edad</th><th>Sexo</th><th>IMC</th><th>EPWORTH</th><th>Acciones</th></tr></thead>
+                    <thead>
+                        <tr><th>Nombre</th><th>Fecha estudio</th><th>Edad</th><th>Sexo</th><th>IMC</th><th>EPWORTH</th><th>Acciones</th></tr>
+                    </thead>
                     <tbody id="tbody-pacientes"></tbody>
                 </table>
             </div>
+
+            <!-- ══ USUARIOS ══ -->
             <div id="sec-usuarios" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Gestión de usuarios</span>
@@ -1384,27 +1199,35 @@ def admin_panel(request: Request):
                     <tbody id="tbody-usuarios"></tbody>
                 </table>
             </div>
+
+            <!-- ══ MONITOREO ══ -->
             <div id="sec-monitoreo" class="section">
                 <div class="toolbar">
                     <span style="font-size:13px; color:#5A7A8A;">Registros históricos enviados por ESP32</span>
                     <button class="btn btn-primary" onclick="cargarMonitoreo()">🔄 Actualizar</button>
                 </div>
                 <table>
-                    <thead><tr><th>Paciente</th><th>Hora</th><th>SpO2</th><th>ECG</th><th>Acce Z</th><th>Flujo</th><th>N° Apnea</th><th>Duración</th></tr></thead>
+                    <thead>
+                        <tr><th>Paciente</th><th>Hora</th><th>SpO2</th><th>ECG</th><th>Acce Z</th><th>Flujo</th><th>N° Apnea</th><th>Duración</th></tr>
+                    </thead>
                     <tbody id="tbody-monitoreo"></tbody>
                 </table>
             </div>
+
+            <!-- ══ VISOR DE SEÑALES ══ -->
             <div id="sec-senales" class="section">
                 <div class="visor-layout">
                     <div>
                         <div class="visor-panel">
                             <h3>📁 Navegación</h3>
+
                             <label style="font-size:11px;color:#5A7A8A;font-weight:bold;">PACIENTE</label>
                             <div class="sel-row">
                                 <select class="visor-select" id="sel-paciente" onchange="onPacienteChange()" style="margin-bottom:0;">
                                     <option value="">— Seleccionar —</option>
                                 </select>
                             </div>
+
                             <label style="font-size:11px;color:#5A7A8A;font-weight:bold;">SESIÓN</label>
                             <div class="sel-row">
                                 <select class="visor-select" id="sel-sesion" onchange="onSesionChange()" disabled style="margin-bottom:0;">
@@ -1412,6 +1235,7 @@ def admin_panel(request: Request):
                                 </select>
                                 <button class="btn-del-sm" id="btn-del-sesion" onclick="confirmarEliminarSesion()" disabled title="Eliminar sesión">🗑️</button>
                             </div>
+
                             <h3 style="margin-top:16px;">⚡ Apneas detectadas</h3>
                             <div id="interr-list" class="interr-list">
                                 <p style="font-size:12px;color:#5A7A8A;text-align:center;padding:20px 0;">Selecciona un paciente y sesión</p>
@@ -1436,6 +1260,7 @@ def admin_panel(request: Request):
             </div>
         </div>
 
+        <!-- MODAL PACIENTE -->
         <div class="modal-bg" id="modal-paciente">
             <div class="modal">
                 <h2 id="modal-pac-titulo">Paciente</h2>
@@ -1459,6 +1284,8 @@ def admin_panel(request: Request):
                 </div>
             </div>
         </div>
+
+        <!-- MODAL USUARIO -->
         <div class="modal-bg" id="modal-usuario">
             <div class="modal">
                 <h2>Nuevo Usuario</h2>
@@ -1470,6 +1297,8 @@ def admin_panel(request: Request):
                 </div>
             </div>
         </div>
+
+        <!-- MODAL CONFIRMACIÓN ELIMINACIÓN -->
         <div class="modal-bg" id="modal-confirm">
             <div class="modal-confirm">
                 <h3 id="confirm-titulo">¿Eliminar?</h3>
@@ -1480,14 +1309,15 @@ def admin_panel(request: Request):
                 </div>
             </div>
         </div>
+
         <div class="toast" id="toast"></div>
 
         <script>
             let pacientes = [];
             let chartInstances = {};
             let senalesCache = {};
-            let apneaActivaId = null;
-            let sesionActivaId = null;
+            let apneaActivaId = null;   // id de la interrupción seleccionada
+            let sesionActivaId = null;  // id de la sesión seleccionada en el visor
 
             const SIGNAL_CONFIG = {
                 ecg:    { label: 'ECG',                 color: '#E05C5C', bg: 'rgba(224,92,92,0.08)',   unit: 'mV',   emoji: '❤️'  },
@@ -1516,6 +1346,9 @@ def admin_panel(request: Request):
                 if (tab === 'senales')   iniciarVisor();
             }
 
+            // ══════════════════════════════════════════════
+            // MODAL DE CONFIRMACIÓN GENÉRICO
+            // ══════════════════════════════════════════════
             function abrirConfirm(titulo, texto, fnConfirmar) {
                 document.getElementById('confirm-titulo').textContent = titulo;
                 document.getElementById('confirm-texto').textContent  = texto;
@@ -1524,6 +1357,9 @@ def admin_panel(request: Request):
                 document.getElementById('modal-confirm').classList.add('show');
             }
 
+            // ══════════════════════════════════════════════
+            // VISOR DE SEÑALES
+            // ══════════════════════════════════════════════
             async function iniciarVisor() {
                 const res = await fetch('/pacientes');
                 const pacs = await res.json();
@@ -1571,11 +1407,14 @@ def admin_panel(request: Request):
                         '<p style="font-size:12px;color:#5A7A8A;text-align:center;padding:20px 0;">Selecciona una sesión</p>';
                     return;
                 }
-                document.getElementById('interr-list').innerHTML = '<div class="loading-msg">Cargando apneas...</div>';
+                document.getElementById('interr-list').innerHTML =
+                    '<div class="loading-msg">Cargando apneas...</div>';
+
                 const resHoras = await fetch('/horas-sesion/' + sesId);
                 const horas = await resHoras.json();
                 window._horaOrdenMap = {};
                 horas.forEach(h => { window._horaOrdenMap[h.numero_hora] = h.hora_orden; });
+
                 const res = await fetch('/interrupciones-sesion/' + sesId);
                 const interrupciones = await res.json();
                 renderInterrList(interrupciones);
@@ -1595,7 +1434,9 @@ def admin_panel(request: Request):
                     return `
                     <div class="interr-item" id="item-${i.id}" onclick="cargarSenales(${i.id}, this)">
                         <div class="interr-title">Apnea #${numApnea} · Hora ${horaOrden}</div>
-                        <div class="interr-meta">🕐 ${i.hora_detectada || '--'} &nbsp;|&nbsp; ⏱️ ${i.duracion_segundos}s</div>
+                        <div class="interr-meta">
+                            🕐 ${i.hora_detectada || '--'} &nbsp;|&nbsp; ⏱️ ${i.duracion_segundos}s
+                        </div>
                         <div style="margin-top:5px;">
                             <span class="badge ${spo2Class}">SpO₂ ${i.spo2}%</span>
                             &nbsp;
@@ -1614,10 +1455,12 @@ def admin_panel(request: Request):
                 document.getElementById('charts-placeholder').style.display = 'none';
                 document.getElementById('charts-container').style.display = 'block';
                 document.getElementById('charts-area').innerHTML = '<div class="loading-msg">⏳ Cargando señales...</div>';
+
                 const titulo = el.querySelector('.interr-title').textContent;
                 const meta   = el.querySelector('.interr-meta').textContent;
                 document.getElementById('interr-info-text').innerHTML =
                     '<strong>' + titulo + '</strong> &nbsp;·&nbsp; ' + meta;
+
                 let data = senalesCache[interrupcionId];
                 if (!data) {
                     try {
@@ -1633,6 +1476,7 @@ def admin_panel(request: Request):
                         return;
                     }
                 }
+
                 const tipos = Object.keys(data);
                 if (!tipos.length) {
                     document.getElementById('charts-area').innerHTML =
@@ -1643,44 +1487,59 @@ def admin_panel(request: Request):
                 renderTabsSignal(tipos, data);
             }
 
+            // ── Eliminar apnea (interrupción) ──────────────────────────────────────
             function confirmarEliminarApnea() {
                 if (!apneaActivaId) return;
-                abrirConfirm('🗑️ Eliminar apnea',
+                abrirConfirm(
+                    '🗑️ Eliminar apnea',
                     'Se eliminarán la apnea y todas sus señales almacenadas. Esta acción no se puede deshacer.',
                     async () => {
                         const res = await fetch('/interrupciones/' + apneaActivaId, { method: 'DELETE' });
                         if (res.ok) {
                             mostrarToast('✅ Apnea eliminada');
                             apneaActivaId = null;
+                            delete senalesCache[apneaActivaId];
                             resetCharts();
+                            // Recargar lista de apneas
                             const sesId = document.getElementById('sel-sesion').value;
                             if (sesId) onSesionChange();
-                        } else mostrarToast('❌ Error al eliminar apnea');
+                        } else {
+                            mostrarToast('❌ Error al eliminar apnea');
+                        }
                     }
                 );
             }
 
+            // ── Eliminar sesión completa ───────────────────────────────────────────
             function confirmarEliminarSesion() {
                 if (!sesionActivaId) return;
                 const sesText = document.getElementById('sel-sesion').options[document.getElementById('sel-sesion').selectedIndex].text;
-                abrirConfirm('🗑️ Eliminar sesión',
-                    `Se eliminarán "${sesText}" y todos sus datos. Esta acción no se puede deshacer.`,
+                abrirConfirm(
+                    '🗑️ Eliminar sesión',
+                    `Se eliminarán "${sesText}" y todos sus datos: horas, apneas y señales. Esta acción no se puede deshacer.`,
                     async () => {
                         const res = await fetch('/sesiones/' + sesionActivaId, { method: 'DELETE' });
                         if (res.ok) {
                             mostrarToast('✅ Sesión eliminada');
-                            sesionActivaId = null; apneaActivaId = null; senalesCache = {};
+                            sesionActivaId = null;
+                            apneaActivaId  = null;
+                            senalesCache   = {};
                             resetCharts();
+                            // Refrescar selector de sesiones
                             const pacId = document.getElementById('sel-paciente').value;
                             if (pacId) onPacienteChange();
-                        } else mostrarToast('❌ Error al eliminar sesión');
+                        } else {
+                            mostrarToast('❌ Error al eliminar sesión');
+                        }
                     }
                 );
             }
 
             function renderTabsSignal(tipos, data) {
                 const orden = ['frecuencia_respiratoria', 'ecg', 'spo2', 'acce_z', 'flujo'];
-                const tiposOrdenados = orden.filter(t => tipos.includes(t)).concat(tipos.filter(t => !orden.includes(t)));
+                const tiposOrdenados = orden.filter(t => tipos.includes(t))
+                    .concat(tipos.filter(t => !orden.includes(t)));
+
                 const tabsCont = document.getElementById('tabs-signal');
                 tabsCont.innerHTML = tiposOrdenados.map((tipo, idx) => {
                     const cfg = SIGNAL_CONFIG[tipo] || { label: tipo, emoji: '📶' };
@@ -1689,9 +1548,11 @@ def admin_panel(request: Request):
                         ${cfg.emoji} ${cfg.label} <span style="opacity:0.7;font-size:10px;">(${n})</span>
                     </span>`;
                 }).join('');
-                window._signalData = data;
+
+                window._signalData  = data;
                 window._signalTipos = tiposOrdenados;
                 mostrarChartTipo(tiposOrdenados[0], data);
+
                 document.querySelectorAll('.tab-signal').forEach(tab => {
                     tab.onclick = () => {
                         document.querySelectorAll('.tab-signal').forEach(t => t.classList.remove('active'));
@@ -1705,38 +1566,64 @@ def admin_panel(request: Request):
                 if (timestamps.length < 20) return null;
                 const duracionTotal = (timestamps[timestamps.length - 1] - timestamps[0]) / 1000.0;
                 if (duracionTotal <= 0) return null;
+            
+                // Frecuencia de muestreo estimada
                 const fs = timestamps.length / duracionTotal;
+            
+                // 1. Diferenciación (resalta pendientes de pico R)
                 const diff = [];
-                for (let i = 1; i < valores.length; i++) diff.push(valores[i] - valores[i - 1]);
+                for (let i = 1; i < valores.length; i++) {
+                    diff.push(valores[i] - valores[i - 1]);
+                }
+            
+                // 2. Elevar al cuadrado (amplifica y positiviza)
                 const sq = diff.map(v => v * v);
+            
+                // 3. Ventana de integración (150ms aprox)
                 const winSamples = Math.max(3, Math.round(fs * 0.15));
                 const integrated = [];
                 for (let i = 0; i < sq.length; i++) {
                     let sum = 0, count = 0;
-                    for (let j = Math.max(0, i - winSamples); j <= i; j++) { sum += sq[j]; count++; }
+                    for (let j = Math.max(0, i - winSamples); j <= i; j++) {
+                        sum += sq[j]; count++;
+                    }
                     integrated.push(sum / count);
                 }
+            
+                // 4. Umbral adaptativo basado en la media
                 const media = integrated.reduce((a, b) => a + b, 0) / integrated.length;
                 const umbral = media * 0.5;
+            
+                // 5. Detectar picos con periodo refractario (200ms mínimo entre picos)
                 const refractario = Math.round(fs * 0.2);
-                let picos = 0, ultimoPico = -refractario, enPico = false;
+                let picos = 0;
+                let ultimoPico = -refractario;
+                let enPico = false;
+            
                 for (let i = 1; i < integrated.length - 1; i++) {
                     if (integrated[i] > umbral) {
                         if (!enPico && (i - ultimoPico) >= refractario &&
                             integrated[i] >= integrated[i - 1] && integrated[i] >= integrated[i + 1]) {
-                            picos++; ultimoPico = i; enPico = true;
+                            picos++;
+                            ultimoPico = i;
+                            enPico = true;
                         }
-                    } else enPico = false;
+                    } else {
+                        enPico = false;
+                    }
                 }
+            
                 if (picos < 2) return null;
                 const fc = Math.round((picos / duracionTotal) * 60);
                 return (fc >= 30 && fc <= 220) ? fc : null;
             }
-
             function detectarYFiltrarRuido(timestamps, valores) {
                 if (timestamps.length < 50) return { valores, filtrado: false };
+            
                 const duracion = (timestamps[timestamps.length - 1] - timestamps[0]) / 1000.0;
                 const fs = timestamps.length / duracion;
+            
+                // Detección de energía en banda 55-65 Hz mediante correlación con sinusoide 60Hz
                 const energia60 = (() => {
                     let sumSin = 0, sumCos = 0, sumTotal = 0;
                     const f0 = 60;
@@ -1751,73 +1638,154 @@ def admin_panel(request: Request):
                     const potTotal = sumTotal / valores.length;
                     return potTotal > 0 ? pot60 / potTotal : 0;
                 })();
+            
+                // Si la energía en 60 Hz es mayor al 20% de la energía total → hay ruido
                 if (energia60 < 0.20) return { valores, filtrado: false };
-                const r = 0.95, omega = 2 * Math.PI * 60 / fs, cosOmega = Math.cos(omega);
+            
+                // Filtro notch IIR para 60 Hz
+                const r = 0.95;
+                const omega = 2 * Math.PI * 60 / fs;
+                const cosOmega = Math.cos(omega);
                 const b0 = 1, b1 = -2 * cosOmega, b2 = 1;
                 const a1 = -2 * r * cosOmega, a2 = r * r;
+            
                 const filtrado = new Array(valores.length).fill(0);
                 for (let i = 0; i < valores.length; i++) {
-                    const x0 = valores[i], x1 = i>=1?valores[i-1]:0, x2 = i>=2?valores[i-2]:0;
-                    const y1 = i>=1?filtrado[i-1]:0, y2 = i>=2?filtrado[i-2]:0;
-                    filtrado[i] = b0*x0 + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+                    const x0 = valores[i];
+                    const x1 = i >= 1 ? valores[i - 1] : 0;
+                    const x2 = i >= 2 ? valores[i - 2] : 0;
+                    const y1 = i >= 1 ? filtrado[i - 1] : 0;
+                    const y2 = i >= 2 ? filtrado[i - 2] : 0;
+                    filtrado[i] = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
                 }
+            
                 return { valores: filtrado, filtrado: true };
             }
-
             function mostrarChartTipo(tipo, data) {
                 const area = document.getElementById('charts-area');
-                const cfg = SIGNAL_CONFIG[tipo] || { label: tipo, color: '#7AAFC5', bg: 'rgba(122,175,197,0.1)', unit: '', emoji: '📶' };
+                const cfg  = SIGNAL_CONFIG[tipo] || {
+                    label: tipo, color: '#7AAFC5', bg: 'rgba(122,175,197,0.1)', unit: '', emoji: '📶'
+                };
                 const señal = data[tipo];
-                let valoresGrafica = señal ? señal.valores : [];
+                // --- INICIO MODIFICACIÓN ---
+                let valoresGrafica = señal.valores;
                 let filtroAplicado = false;
-                if (tipo === 'ecg' && señal && señal.timestamps.length > 0) {
+                
+                if (tipo === 'ecg' && señal.timestamps.length > 0) {
                     const resultado = detectarYFiltrarRuido(señal.timestamps, señal.valores);
                     valoresGrafica = resultado.valores;
                     filtroAplicado = resultado.filtrado;
                 }
+                // --- FIN MODIFICACIÓN ---
+
                 if (!señal || !señal.timestamps.length) {
                     area.innerHTML = `<div class="no-signal">Sin datos para ${cfg.label}</div>`;
                     return;
                 }
-                if (chartInstances[tipo]) { chartInstances[tipo].destroy(); delete chartInstances[tipo]; }
+
+                if (chartInstances[tipo]) {
+                    chartInstances[tipo].destroy();
+                    delete chartInstances[tipo];
+                }
+
                 const canvasId = 'chart-' + tipo;
                 const vMin = Math.min(...señal.valores);
                 const vMax = Math.max(...señal.valores);
+
                 let extraHtml = '';
                 if (tipo === 'frecuencia_respiratoria') {
-                    const durSeg = señal.timestamps.length > 1 ? ((señal.timestamps[señal.timestamps.length-1] - señal.timestamps[0]) / 1000).toFixed(1) : '--';
-                    extraHtml = `<div style="margin-bottom:8px;font-size:11px;color:#5A7A8A;">Señal respiratoria combinada · Duración: ${durSeg}s · Rango: ${vMin.toFixed(0)} – ${vMax.toFixed(0)} ADC</div>`;
+                    const durSeg = señal.timestamps.length > 1
+                        ? ((señal.timestamps[señal.timestamps.length-1] - señal.timestamps[0]) / 1000).toFixed(1)
+                        : '--';
+                    extraHtml = `<div style="margin-bottom:8px;font-size:11px;color:#5A7A8A;">
+                        Señal respiratoria combinada (flujo + aceleración Z) &nbsp;·&nbsp;
+                        Duración: ${durSeg}s &nbsp;·&nbsp; Rango: ${vMin.toFixed(0)} – ${vMax.toFixed(0)} ADC
+                    </div>`;
                 }
                 if (tipo === 'ecg') {
-                    const fc = calcularFC(señal.timestamps, valoresGrafica);
+                    const fc = calcularFC(señal.timestamps, valoresGrafica); // ← usa valoresGrafica
                     let fcHtml = fc ? `<span class="fc-badge">❤️ ${fc} lpm</span>` : '';
-                    let filtroHtml = filtroAplicado ? `<span style="font-size:11px;background:#FFF8EC;color:#B07020;padding:2px 8px;border-radius:10px;margin-left:8px;">⚡ Filtro 60Hz activo</span>` : '';
-                    extraHtml = `<div style="margin-bottom:10px;"><span style="font-size:12px;color:#5A7A8A;">Frecuencia cardiaca estimada: </span>${fcHtml}${filtroHtml}</div>`;
+                    let filtroHtml = filtroAplicado
+                        ? `<span style="font-size:11px;background:#FFF8EC;color:#B07020;padding:2px 8px;border-radius:10px;margin-left:8px;">⚡ Filtro 60Hz activo</span>`
+                        : '';
+                    extraHtml = `<div style="margin-bottom:10px;">
+                        <span style="font-size:12px;color:#5A7A8A;">Frecuencia cardiaca estimada: </span>
+                        ${fcHtml}${filtroHtml}
+                    </div>`;
                 }
-                const statsHtml = `<div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:4px;">
-                    ${statBox('Mínimo', vMin.toFixed(2), cfg.unit)}
-                    ${statBox('Máximo', vMax.toFixed(2), cfg.unit)}
-                    ${statBox('Promedio', (señal.valores.reduce((a,b)=>a+b,0)/señal.valores.length).toFixed(2), cfg.unit)}
-                </div>`;
-                area.innerHTML = `<div class="chart-card"><h4>${cfg.emoji} ${cfg.label} — ${señal.timestamps.length} muestras</h4>${extraHtml}<canvas id="${canvasId}" height="160"></canvas></div>${statsHtml}`;
+
+                const statsHtml = `
+                    <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:4px;">
+                        ${statBox('Mínimo', vMin.toFixed(2), cfg.unit)}
+                        ${statBox('Máximo', vMax.toFixed(2), cfg.unit)}
+                        ${statBox('Promedio', (señal.valores.reduce((a,b)=>a+b,0)/señal.valores.length).toFixed(2), cfg.unit)}
+                    </div>`;
+
+                area.innerHTML = `
+                    <div class="chart-card">
+                        <h4>${cfg.emoji} ${cfg.label} — ${señal.timestamps.length} muestras</h4>
+                        ${extraHtml}
+                        <canvas id="${canvasId}" height="160"></canvas>
+                    </div>
+                    ${statsHtml}`;
+
                 const ctx = document.getElementById(canvasId).getContext('2d');
                 const t0 = señal.timestamps[0];
                 const labels = señal.timestamps.map(t => ((t - t0) / 1000).toFixed(2) + 's');
-                const esResp = tipo==='frecuencia_respiratoria', esEcg=tipo==='ecg', esAccz=tipo==='acce_z', esFlujo=tipo==='flujo';
+
+                const esResp  = tipo === 'frecuencia_respiratoria';
+                const esEcg   = tipo === 'ecg';
+                const esAccz  = tipo === 'acce_z';
+                const esFlujo = tipo === 'flujo';
                 const tension = esEcg ? 0 : (esResp ? 0.5 : (esAccz ? 0.45 : (esFlujo ? 0.4 : 0.3)));
+
                 let yScaleOpts;
-                const rango = vMax - vMin, pad = Math.max(rango * 0.10, esEcg ? 5 : 1.0);
-                yScaleOpts = { min: vMin-pad, max: vMax+pad, ticks:{font:{size:10},color:'#5A7A8A'}, grid:{color:'#EEF5FB'} };
+                if (tipo === 'ecg') {
+                    const pad = Math.max((vMax - vMin) * 0.1, 5);
+                    yScaleOpts = { min: vMin - pad, max: vMax + pad,
+                        ticks: { font: { size: 10 }, color: '#5A7A8A' }, grid: { color: '#EEF5FB' } };
+                } else {
+                    const rango = vMax - vMin;
+                    const pad = Math.max(rango * 0.10, 1.0);
+                    yScaleOpts = { min: vMin - pad, max: vMax + pad,
+                        ticks: { font: { size: 10 }, color: '#5A7A8A' }, grid: { color: '#EEF5FB' } };
+                }
+
                 const ocultarPuntos = señal.timestamps.length > 100 || esResp || esAccz || esFlujo;
+
                 chartInstances[tipo] = new Chart(ctx, {
                     type: 'line',
-                    data: { labels, datasets: [{ label: cfg.label, data: valoresGrafica, borderColor: cfg.color, backgroundColor: cfg.bg,
-                        borderWidth: esEcg?1.2:(esResp?2.5:(esAccz?1.8:1.6)), pointRadius: ocultarPuntos?0:2, pointHoverRadius:4,
-                        fill: !esEcg, tension, cubicInterpolationMode:'monotone' }] },
-                    options: { responsive:true, animation:{duration:300},
-                        plugins:{ legend:{display:false}, tooltip:{callbacks:{label:ctx=>` ${ctx.parsed.y.toFixed(2)} ${cfg.unit}`}} },
-                        scales:{ x:{ticks:{maxTicksLimit:12,font:{size:10},color:'#5A7A8A'},grid:{color:'#EEF5FB'},
-                            title:{display:true,text:'Tiempo (s)',font:{size:10},color:'#5A7A8A'}}, y:yScaleOpts } }
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: cfg.label,
+                            data: valoresGrafica,
+                            borderColor: cfg.color,
+                            backgroundColor: cfg.bg,
+                            borderWidth: esEcg ? 1.2 : (esResp ? 2.5 : (esAccz ? 1.8 : 1.6)),
+                            pointRadius: ocultarPuntos ? 0 : 2,
+                            pointHoverRadius: 4,
+                            fill: !esEcg,
+                            tension: tension,
+                            cubicInterpolationMode: 'monotone',
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        animation: { duration: 300 },
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: { callbacks: { label: ctx => ` ${ctx.parsed.y.toFixed(2)} ${cfg.unit}` } }
+                        },
+                        scales: {
+                            x: {
+                                ticks: { maxTicksLimit: 12, font: { size: 10 }, color: '#5A7A8A' },
+                                grid: { color: '#EEF5FB' },
+                                title: { display: true, text: 'Tiempo (s)', font: { size: 10 }, color: '#5A7A8A' }
+                            },
+                            y: yScaleOpts
+                        }
+                    }
                 });
             }
 
@@ -1839,6 +1807,9 @@ def admin_panel(request: Request):
                 apneaActivaId = null;
             }
 
+            // ══════════════════════════════════════════════
+            // PACIENTES
+            // ══════════════════════════════════════════════
             async function cargarPacientes() {
                 const res = await fetch('/pacientes');
                 pacientes = await res.json();
@@ -1846,7 +1817,8 @@ def admin_panel(request: Request):
             }
 
             function mostrarPacientes(datos) {
-                document.getElementById('tbody-pacientes').innerHTML = datos.map(p => `
+                const tb = document.getElementById('tbody-pacientes');
+                tb.innerHTML = datos.map(p => `
                     <tr>
                         <td><strong>${p.nombre}</strong></td>
                         <td>${p.fecha_estudio || '--'}</td>
@@ -1858,7 +1830,8 @@ def admin_panel(request: Request):
                             <button class="btn btn-edit" onclick='editarPaciente(${JSON.stringify(p)})'>✏️</button>
                             <button class="btn btn-danger" onclick="confirmarEliminarPaciente(${p.id}, '${p.nombre.replace(/'/g, "\\'")}')">🗑️</button>
                         </td>
-                    </tr>`).join('');
+                    </tr>
+                `).join('');
             }
 
             function filtrarPacientes() {
@@ -1879,35 +1852,47 @@ def admin_panel(request: Request):
                         <td>${d.flujo || 0}</td>
                         <td>${d.numero_apnea}</td>
                         <td>${d.duracion_apnea}s</td>
-                    </tr>`).join('');
+                    </tr>
+                `).join('');
             }
 
             async function cargarUsuarios() {
                 const res = await fetch('/usuarios');
                 const data = await res.json();
                 document.getElementById('tbody-usuarios').innerHTML = data.map(u => `
-                    <tr><td>${u.id}</td><td>${u.usuario}</td>
-                    <td><button class="btn btn-danger" onclick="confirmarEliminarUsuario(${u.id}, '${u.usuario}')">🗑️</button></td>
-                    </tr>`).join('');
+                    <tr>
+                        <td>${u.id}</td>
+                        <td>${u.usuario}</td>
+                        <td>
+                            <button class="btn btn-danger" onclick="confirmarEliminarUsuario(${u.id}, '${u.usuario}')">🗑️</button>
+                        </td>
+                    </tr>
+                `).join('');
             }
 
+            // ── Confirmaciones de eliminación ──────────────────────────────────────
             function confirmarEliminarPaciente(id, nombre) {
-                abrirConfirm('🗑️ Eliminar paciente',
-                    `Se eliminarán todos los datos de "${nombre}". Esta acción no se puede deshacer.`,
+                abrirConfirm(
+                    '🗑️ Eliminar paciente',
+                    `Se eliminarán todos los datos de "${nombre}": sesiones, horas, apneas y señales. Esta acción no se puede deshacer.`,
                     async () => {
                         const res = await fetch('/pacientes/' + id, { method: 'DELETE' });
                         if (res.ok) { mostrarToast('✅ Paciente eliminado'); cargarPacientes(); }
                         else mostrarToast('❌ Error al eliminar paciente');
-                    });
+                    }
+                );
             }
 
             function confirmarEliminarUsuario(id, nombre) {
-                abrirConfirm('🗑️ Eliminar usuario', `¿Eliminar al usuario "${nombre}"?`,
+                abrirConfirm(
+                    '🗑️ Eliminar usuario',
+                    `¿Eliminar al usuario "${nombre}"?`,
                     async () => {
                         const res = await fetch('/usuarios/' + id, { method: 'DELETE' });
                         if (res.ok) { mostrarToast('✅ Usuario eliminado'); cargarUsuarios(); }
                         else mostrarToast('❌ Error al eliminar usuario');
-                    });
+                    }
+                );
             }
 
             function abrirModalPaciente() {
@@ -1941,16 +1926,22 @@ def admin_panel(request: Request):
                     imc: parseFloat(document.getElementById('pac-imc').value) || null,
                     epworth: parseInt(document.getElementById('pac-epworth').value) || null
                 };
-                await fetch(id ? '/pacientes/'+id : '/pacientes', {
-                    method: id ? 'PUT' : 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+                await fetch(id ? '/pacientes/' + id : '/pacientes', {
+                    method: id ? 'PUT' : 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
                 });
                 cerrarModals(); cargarPacientes(); mostrarToast('✅ Guardado');
             }
 
             async function guardarUsuario() {
                 await fetch('/usuarios', {
-                    method: 'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({ usuario: document.getElementById('usr-nombre').value, contrasena: document.getElementById('usr-pass').value })
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        usuario: document.getElementById('usr-nombre').value,
+                        contrasena: document.getElementById('usr-pass').value
+                    })
                 });
                 cerrarModals(); cargarUsuarios(); mostrarToast('✅ Usuario creado');
             }
