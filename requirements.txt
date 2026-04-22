@@ -4,3 +4,4 @@ mysql-connector-python
 pydantic
 python-multipart
 bcrypt
+paho-mqtt==1.6.1
