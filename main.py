@@ -1440,6 +1440,7 @@ def admin_panel(request: Request):
             <div class="tab" onclick="cambiarTab('monitoreo', event)">📊 Monitoreo ESP32</div>
             <div class="tab" onclick="cambiarTab('senales', event)">📈 Visor de Señales</div>
             <div class="tab" onclick="cambiarTab('estado', event)">🔋 Estado Sensores</div>
+            <div class="tab" onclick="cambiarTab('microsd', event)">💾 MicroSD</div>
         </div>
         <div class="content">
             <!-- ══ PACIENTES ══ -->
@@ -1549,7 +1550,256 @@ def admin_panel(request: Request):
                     <tbody id="tbody-estado"></tbody>
                 </table>
             </div>
+        MODAL PACIENT<!-- ══ MICROSD ══ -->
+            <div id="sec-microsd" class="section">
+                <div class="toolbar">
+                    <span style="font-size:13px; color:#5A7A8A;">
+                        Sincronización desde respaldo MicroSD — verifica y sube apneas no enviadas
+                    </span>
+                </div>
 
+                <!-- Dropzone -->
+                <div id="microsd-dropzone"
+                     style="border: 2px dashed #7AAFC5; border-radius: 10px; padding: 40px;
+                            text-align: center; background: #EEF5FB; cursor: pointer;
+                            transition: border-color 0.2s;"
+                     ondragover="event.preventDefault(); this.style.borderColor='#2C4A5A';"
+                     ondragleave="this.style.borderColor='#7AAFC5';"
+                     ondrop="onMicrosdDrop(event)"
+                     onclick="document.getElementById('microsd-input').click()">
+                    <div style="font-size: 36px; margin-bottom: 10px;">💾</div>
+                    <div style="font-size: 15px; font-weight: bold; color: #2C4A5A; margin-bottom: 6px;">
+                        Arrastra el archivo Excel aquí
+                    </div>
+                    <div style="font-size: 12px; color: #5A7A8A;">
+                        o haz clic para seleccionarlo — formato .xlsx exportado por el ESP32
+                    </div>
+                    <input type="file" id="microsd-input" accept=".xlsx"
+                           style="display:none" onchange="onMicrosdFileSelect(event)">
+                </div>
+
+                <!-- Nombre de archivo seleccionado -->
+                <div id="microsd-filename"
+                     style="display:none; align-items:center; gap:10px;
+                            margin-top:12px; padding:10px 16px;
+                            background:#E3F2FA; border:1px solid #7AAFC5;
+                            border-radius:6px; font-size:13px; color:#2C4A5A;">
+                    <span>📄</span>
+                    <span id="microsd-fname-text"></span>
+                </div>
+
+                <!-- Botones de acción -->
+                <div style="display:flex; gap:10px; margin-top:16px;">
+                    <button id="btn-analizar" class="btn btn-primary"
+                            onclick="analizarMicrosd()"
+                            style="display:flex; align-items:center; gap:6px;">
+                        🔍 Analizar
+                    </button>
+                    <button id="btn-sincronizar" class="btn"
+                            onclick="sincronizarMicrosd()"
+                            style="background:#2E7D52; color:white; display:flex;
+                                   align-items:center; gap:6px;">
+                        ⬆️ Subir apneas faltantes
+                    </button>
+                </div>
+
+                <!-- Resultado del análisis -->
+                <div id="microsd-resultado" style="display:none; margin-top:24px;">
+
+                    <!-- Cards resumen -->
+                    <div id="microsd-cards"
+                         style="display:grid; grid-template-columns:repeat(3,1fr);
+                                gap:14px; margin-bottom:20px;"></div>
+
+                    <!-- Tabla faltantes -->
+                    <div id="microsd-faltantes-section" style="display:none; margin-bottom:20px;">
+                        <h3 style="font-size:13px; color:#B07020; margin-bottom:10px;">
+                            ⚠️ Apneas no encontradas en la base de datos
+                        </h3>
+                        <table style="width:100%; border-collapse:collapse;
+                                      background:#FFFDF5; border:1px solid #FFE0A0;
+                                      border-radius:8px; overflow:hidden;">
+                            <thead>
+                                <tr style="background:#FFF8EC;">
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#B07020; border-bottom:1px solid #FFE0A0;">
+                                        Paciente</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#B07020; border-bottom:1px solid #FFE0A0;">
+                                        Hora</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#B07020; border-bottom:1px solid #FFE0A0;">
+                                        SpO₂</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#B07020; border-bottom:1px solid #FFE0A0;">
+                                        Duración</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#B07020; border-bottom:1px solid #FFE0A0;">
+                                        Razón</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tbody-faltantes"></tbody>
+                        </table>
+                    </div>
+
+                    <!-- Tabla ya existentes -->
+                    <div id="microsd-existentes-section" style="display:none;">
+                        <h3 style="font-size:13px; color:#2E7D52; margin-bottom:10px;">
+                            ✅ Apneas ya registradas en la base de datos
+                        </h3>
+                        <table style="width:100%; border-collapse:collapse;
+                                      background:#F5FFF8; border:1px solid #A0DDB8;
+                                      border-radius:8px; overflow:hidden;">
+                            <thead>
+                                <tr style="background:#EEF8F2;">
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#2E7D52; border-bottom:1px solid #C8EDD8;">
+                                        Paciente</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#2E7D52; border-bottom:1px solid #C8EDD8;">
+                                        Hora</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#2E7D52; border-bottom:1px solid #C8EDD8;">
+                                        SpO₂</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#2E7D52; border-bottom:1px solid #C8EDD8;">
+                                        Duración</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#2E7D52; border-bottom:1px solid #C8EDD8;">
+                                        ID en BD</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tbody-existentes"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ══ MICROSD ══ -->
+            <div id="sec-microsd" class="section">
+                <div class="toolbar">
+                    <span style="font-size:13px; color:#5A7A8A;">
+                        Sincronización desde respaldo MicroSD — verifica y sube apneas no enviadas
+                    </span>
+                </div>
+
+                <!-- Dropzone -->
+                <div id="microsd-dropzone"
+                     style="border: 2px dashed #7AAFC5; border-radius: 10px; padding: 40px;
+                            text-align: center; background: #EEF5FB; cursor: pointer;
+                            transition: border-color 0.2s;"
+                     ondragover="event.preventDefault(); this.style.borderColor='#2C4A5A';"
+                     ondragleave="this.style.borderColor='#7AAFC5';"
+                     ondrop="onMicrosdDrop(event)"
+                     onclick="document.getElementById('microsd-input').click()">
+                    <div style="font-size: 36px; margin-bottom: 10px;">💾</div>
+                    <div style="font-size: 15px; font-weight: bold; color: #2C4A5A; margin-bottom: 6px;">
+                        Arrastra el archivo Excel aquí
+                    </div>
+                    <div style="font-size: 12px; color: #5A7A8A;">
+                        o haz clic para seleccionarlo — formato .xlsx exportado por el ESP32
+                    </div>
+                    <input type="file" id="microsd-input" accept=".xlsx"
+                           style="display:none" onchange="onMicrosdFileSelect(event)">
+                </div>
+
+                <!-- Nombre de archivo seleccionado -->
+                <div id="microsd-filename"
+                     style="display:none; align-items:center; gap:10px;
+                            margin-top:12px; padding:10px 16px;
+                            background:#E3F2FA; border:1px solid #7AAFC5;
+                            border-radius:6px; font-size:13px; color:#2C4A5A;">
+                    <span>📄</span>
+                    <span id="microsd-fname-text"></span>
+                </div>
+
+                <!-- Botones de acción -->
+                <div style="display:flex; gap:10px; margin-top:16px;">
+                    <button id="btn-analizar" class="btn btn-primary"
+                            onclick="analizarMicrosd()"
+                            style="display:flex; align-items:center; gap:6px;">
+                        🔍 Analizar
+                    </button>
+                    <button id="btn-sincronizar" class="btn"
+                            onclick="sincronizarMicrosd()"
+                            style="background:#2E7D52; color:white; display:flex;
+                                   align-items:center; gap:6px;">
+                        ⬆️ Subir apneas faltantes
+                    </button>
+                </div>
+
+                <!-- Resultado del análisis -->
+                <div id="microsd-resultado" style="display:none; margin-top:24px;">
+
+                    <!-- Cards resumen -->
+                    <div id="microsd-cards"
+                         style="display:grid; grid-template-columns:repeat(3,1fr);
+                                gap:14px; margin-bottom:20px;"></div>
+
+                    <!-- Tabla faltantes -->
+                    <div id="microsd-faltantes-section" style="display:none; margin-bottom:20px;">
+                        <h3 style="font-size:13px; color:#B07020; margin-bottom:10px;">
+                            ⚠️ Apneas no encontradas en la base de datos
+                        </h3>
+                        <table style="width:100%; border-collapse:collapse;
+                                      background:#FFFDF5; border:1px solid #FFE0A0;
+                                      border-radius:8px; overflow:hidden;">
+                            <thead>
+                                <tr style="background:#FFF8EC;">
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#B07020; border-bottom:1px solid #FFE0A0;">
+                                        Paciente</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#B07020; border-bottom:1px solid #FFE0A0;">
+                                        Hora</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#B07020; border-bottom:1px solid #FFE0A0;">
+                                        SpO₂</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#B07020; border-bottom:1px solid #FFE0A0;">
+                                        Duración</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#B07020; border-bottom:1px solid #FFE0A0;">
+                                        Razón</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tbody-faltantes"></tbody>
+                        </table>
+                    </div>
+
+                    <!-- Tabla ya existentes -->
+                    <div id="microsd-existentes-section" style="display:none;">
+                        <h3 style="font-size:13px; color:#2E7D52; margin-bottom:10px;">
+                            ✅ Apneas ya registradas en la base de datos
+                        </h3>
+                        <table style="width:100%; border-collapse:collapse;
+                                      background:#F5FFF8; border:1px solid #A0DDB8;
+                                      border-radius:8px; overflow:hidden;">
+                            <thead>
+                                <tr style="background:#EEF8F2;">
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#2E7D52; border-bottom:1px solid #C8EDD8;">
+                                        Paciente</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#2E7D52; border-bottom:1px solid #C8EDD8;">
+                                        Hora</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#2E7D52; border-bottom:1px solid #C8EDD8;">
+                                        SpO₂</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#2E7D52; border-bottom:1px solid #C8EDD8;">
+                                        Duración</th>
+                                    <th style="padding:10px; text-align:left; font-size:12px;
+                                               color:#2E7D52; border-bottom:1px solid #C8EDD8;">
+                                        ID en BD</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tbody-existentes"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
         <!-- MODAL PACIENTE -->
         <div class="modal-bg" id="modal-paciente">
             <div class="modal">
