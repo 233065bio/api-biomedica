@@ -6,6 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import mysql.connector
 import os
 import bcrypt
+import pandas as pd
+from fastapi import UploadFile, File
+import io
 
 app = FastAPI()
 
@@ -662,6 +665,209 @@ def senales_completas(interrupcion_id: int):
 
         return resultado
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/microsd/analizar")
+async def analizar_microsd(request: Request, archivo: UploadFile = File(...)):
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
+    try:
+        contenido = await archivo.read()
+        df = pd.read_excel(io.BytesIO(contenido))
+        df.columns = [c.strip() for c in df.columns]
+
+        requeridas = {"Nombre_Paciente", "Tiempo(ms)", "ECG", "SpO2", "M.T", "F.R", "No_Apneas", "Hora_Apnea"}
+        if not requeridas.issubset(set(df.columns)):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Columnas requeridas: {requeridas}. Encontradas: {set(df.columns)}"
+            )
+
+        # Agrupar por paciente + No_Apneas + Hora_Apnea → una apnea por grupo
+        grupos = df.groupby(["Nombre_Paciente", "No_Apneas", "Hora_Apnea"])
+
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        ya_en_bd   = []
+        faltantes  = []
+
+        for (nombre_pac, no_apnea, hora_apnea), grupo in grupos:
+            nombre_pac  = str(nombre_pac).strip()
+            hora_val    = str(hora_apnea).strip()
+            spo2_val    = float(grupo["SpO2"].mean())
+            ecg_val     = float(grupo["ECG"].mean())
+            acce_z_val  = float(grupo["M.T"].mean())
+            flujo_val   = float(grupo["F.R"].mean())
+            # Duración estimada: diferencia entre primer y último Tiempo(ms) en segundos
+            tiempos     = grupo["Tiempo(ms)"].values
+            duracion_ms = float(tiempos[-1] - tiempos[0]) if len(tiempos) > 1 else 0.0
+            duracion_s  = round(duracion_ms / 1000.0, 2)
+            n_muestras  = len(grupo)
+
+            # Verificar paciente
+            cursor.execute("SELECT id FROM pacientes WHERE nombre = %s LIMIT 1", (nombre_pac,))
+            pac = cursor.fetchone()
+            if not pac:
+                faltantes.append({
+                    "paciente": nombre_pac, "hora": hora_val,
+                    "spo2": round(spo2_val, 1), "duracion": duracion_s,
+                    "no_apnea": int(no_apnea), "n_muestras": n_muestras,
+                    "_razon": "Paciente no existe en BD"
+                })
+                continue
+
+            # Verificar si ya existe la apnea
+            cursor.execute("""
+                SELECT i.id FROM interrupciones i
+                JOIN horas_sesion hs ON i.hora_sesion_id = hs.id
+                JOIN sesiones s      ON hs.sesion_id = s.id
+                WHERE s.paciente_id = %s
+                  AND i.hora_detectada = %s
+                  AND ABS(i.spo2 - %s) < 1.5
+                LIMIT 1
+            """, (pac["id"], hora_val, spo2_val))
+
+            existe = cursor.fetchone()
+            registro = {
+                "paciente":   nombre_pac,
+                "hora":       hora_val,
+                "spo2":       round(spo2_val, 1),
+                "ecg":        round(ecg_val, 2),
+                "acce_z":     round(acce_z_val, 2),
+                "flujo":      round(flujo_val, 2),
+                "duracion":   duracion_s,
+                "no_apnea":   int(no_apnea),
+                "n_muestras": n_muestras,
+            }
+            if existe:
+                ya_en_bd.append({**registro, "_interrupcion_id": existe["id"]})
+            else:
+                faltantes.append({**registro, "_razon": "No encontrada en BD"})
+
+        cursor.close()
+        conn.close()
+
+        return {
+            "total_apneas_archivo": len(grupos),
+            "total_muestras":       len(df),
+            "ya_en_bd":             len(ya_en_bd),
+            "faltantes":            len(faltantes),
+            "detalle_ya_en_bd":     ya_en_bd,
+            "detalle_faltantes":    faltantes,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"[ERROR /microsd/analizar] {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/microsd/sincronizar")
+async def sincronizar_microsd(request: Request, archivo: UploadFile = File(...)):
+    if not verificar_sesion(request):
+        raise HTTPException(status_code=401, detail="No autorizado")
+    try:
+        contenido = await archivo.read()
+        df = pd.read_excel(io.BytesIO(contenido))
+        df.columns = [c.strip() for c in df.columns]
+
+        grupos     = df.groupby(["Nombre_Paciente", "No_Apneas", "Hora_Apnea"])
+        insertadas = []
+        ya_existian = []
+        errores    = []
+
+        for (nombre_pac, no_apnea, hora_apnea), grupo in grupos:
+            try:
+                nombre_pac = str(nombre_pac).strip()
+                hora_val   = str(hora_apnea).strip()
+                spo2_val   = float(grupo["SpO2"].mean())
+                ecg_val    = float(grupo["ECG"].mean())
+                acce_z_val = float(grupo["M.T"].mean())
+                flujo_val  = float(grupo["F.R"].mean())
+                tiempos    = grupo["Tiempo(ms)"].values
+                duracion_s = round(float(tiempos[-1] - tiempos[0]) / 1000.0, 2) if len(tiempos) > 1 else 0.0
+
+                # Verificar duplicado
+                conn   = get_db_connection()
+                cursor = conn.cursor(dictionary=True)
+                cursor.execute("SELECT id FROM pacientes WHERE nombre = %s LIMIT 1", (nombre_pac,))
+                pac = cursor.fetchone()
+                if pac:
+                    cursor.execute("""
+                        SELECT i.id FROM interrupciones i
+                        JOIN horas_sesion hs ON i.hora_sesion_id = hs.id
+                        JOIN sesiones s      ON hs.sesion_id = s.id
+                        WHERE s.paciente_id = %s
+                          AND i.hora_detectada = %s
+                          AND ABS(i.spo2 - %s) < 1.5
+                        LIMIT 1
+                    """, (pac["id"], hora_val, spo2_val))
+                    if cursor.fetchone():
+                        ya_existian.append(f"{nombre_pac} @ {hora_val}")
+                        cursor.close(); conn.close()
+                        continue
+                cursor.close(); conn.close()
+
+                # Insertar usando la lógica de /subir-datos
+                datos = DatosESP32(
+                    paciente = nombre_pac,
+                    hora     = hora_val,
+                    spo2     = spo2_val,
+                    ecg      = ecg_val,
+                    acce_z   = acce_z_val,
+                    flujo    = flujo_val,
+                    no_apnea = int(no_apnea),
+                    duracion = duracion_s,
+                )
+                resultado = await subir_datos(datos)
+
+                # Insertar también las señales individuales del grupo
+                interrupcion_id = resultado["interrupcion_id"]
+                conn   = get_db_connection()
+                cursor = conn.cursor()
+                senales_rows = []
+                for _, fila in grupo.iterrows():
+                    ts = int(fila["Tiempo(ms)"])
+                    senales_rows += [
+                        (interrupcion_id, "ecg",    ts, float(fila["ECG"])),
+                        (interrupcion_id, "spo2",   ts, float(fila["SpO2"])),
+                        (interrupcion_id, "acce_z", ts, float(fila["M.T"])),
+                        (interrupcion_id, "flujo",  ts, float(fila["F.R"])),
+                    ]
+                cursor.executemany(
+                    "INSERT INTO senales_esp32 (interrupcion_id, tipo_senal, timestamp_ms, valor) VALUES (%s, %s, %s, %s)",
+                    senales_rows
+                )
+                conn.commit()
+                cursor.close()
+                conn.close()
+
+                insertadas.append({
+                    "paciente":        nombre_pac,
+                    "hora":            hora_val,
+                    "interrupcion_id": interrupcion_id,
+                    "muestras_subidas": len(grupo)
+                })
+
+            except Exception as e_row:
+                import traceback
+                errores.append({"apnea": f"{nombre_pac} @ {hora_apnea}", "error": str(e_row)})
+
+        return {
+            "insertadas":          len(insertadas),
+            "ya_existian":         len(ya_existian),
+            "errores":             len(errores),
+            "detalle_insertadas":  insertadas,
+            "detalle_ya_existian": ya_existian,
+            "detalle_errores":     errores,
+        }
+
+    except Exception as e:
+        import traceback
+        print(f"[ERROR /microsd/sincronizar] {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2056,6 +2262,152 @@ def admin_panel(request: Request):
                         <td>${d.flujo}</td>
                     </tr>`;
                 }).join('');
+            }
+
+            // ══════════════════════════════════════════════
+            // MICROSD — ANÁLISIS Y SINCRONIZACIÓN
+            // ══════════════════════════════════════════════
+            let microsdArchivoActual = null;
+            let microsdResultadoActual = null;
+            
+            function onMicrosdDrop(event) {
+                event.preventDefault();
+                document.getElementById('microsd-dropzone').style.borderColor = '#7AAFC5';
+                const file = event.dataTransfer.files[0];
+                if (file) setMicrosdFile(file);
+            }
+            
+            function onMicrosdFileSelect(event) {
+                const file = event.target.files[0];
+                if (file) setMicrosdFile(file);
+            }
+            
+            function setMicrosdFile(file) {
+                microsdArchivoActual = file;
+                document.getElementById('microsd-fname-text').textContent = file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
+                document.getElementById('microsd-filename').style.display = 'flex';
+                document.getElementById('microsd-resultado').style.display = 'none';
+                document.getElementById('microsd-faltantes-section').style.display = 'none';
+                document.getElementById('microsd-existentes-section').style.display = 'none';
+            }
+            
+            async function analizarMicrosd() {
+                if (!microsdArchivoActual) return;
+                const btn = document.getElementById('btn-analizar');
+                btn.textContent = '⏳ Analizando...';
+                btn.disabled = true;
+            
+                const formData = new FormData();
+                formData.append('archivo', microsdArchivoActual);
+            
+                try {
+                    const res = await fetch('/microsd/analizar', { method: 'POST', body: formData });
+                    if (!res.ok) {
+                        const err = await res.json();
+                        mostrarToast('❌ ' + (err.detail || 'Error al analizar'));
+                        return;
+                    }
+                    microsdResultadoActual = await res.json();
+                    mostrarResultadoMicrosd(microsdResultadoActual);
+                } catch (e) {
+                    mostrarToast('❌ Error: ' + e.message);
+                } finally {
+                    btn.textContent = '🔍 Analizar';
+                    btn.disabled = false;
+                }
+            }
+            
+            function mostrarResultadoMicrosd(r) {
+                document.getElementById('microsd-resultado').style.display = 'block';
+            
+                // Cards resumen
+                const pct = r.total_en_archivo > 0
+                    ? Math.round((r.ya_en_bd / r.total_en_archivo) * 100) : 0;
+                document.getElementById('microsd-cards').innerHTML = `
+                    ${cardMicrosd('📋 Total en archivo', r.total_en_archivo, '#2C4A5A', '#EEF5FB', '#D4E8F3')}
+                    ${cardMicrosd('✅ Ya en BD', r.ya_en_bd, '#2E7D52', '#EEF8F2', '#A0DDB8')}
+                    ${cardMicrosd('⚠️ Faltantes', r.faltantes, r.faltantes > 0 ? '#B07020' : '#2E7D52',
+                        r.faltantes > 0 ? '#FFF8EC' : '#EEF8F2',
+                        r.faltantes > 0 ? '#FFE0A0' : '#A0DDB8')}
+                `;
+            
+                // Tabla de faltantes
+                if (r.faltantes > 0) {
+                    document.getElementById('microsd-faltantes-section').style.display = 'block';
+                    document.getElementById('tbody-faltantes').innerHTML =
+                        r.detalle_faltantes.map(ap => `
+                            <tr>
+                                <td style="padding:8px; border-bottom:1px solid #FFE0A0; font-size:13px;">
+                                    ${ap.paciente}</td>
+                                <td style="padding:8px; border-bottom:1px solid #FFE0A0; font-size:13px;">
+                                    ${ap.hora}</td>
+                                <td style="padding:8px; border-bottom:1px solid #FFE0A0; font-size:13px;">
+                                    <span class="badge ${ap.spo2 < 90 ? 'badge-crit' : 'badge-warn'}">
+                                        ${ap.spo2}%</span></td>
+                                <td style="padding:8px; border-bottom:1px solid #FFE0A0; font-size:13px;">
+                                    ${ap.duracion}s</td>
+                                <td style="padding:8px; border-bottom:1px solid #FFE0A0; font-size:12px;
+                                    color:#B07020;">${ap._razon || 'No encontrada en BD'}</td>
+                            </tr>`).join('');
+                } else {
+                    document.getElementById('microsd-faltantes-section').style.display = 'none';
+                }
+            
+                // Tabla de ya existentes
+                if (r.ya_en_bd > 0) {
+                    document.getElementById('microsd-existentes-section').style.display = 'block';
+                    document.getElementById('tbody-existentes').innerHTML =
+                        r.detalle_ya_en_bd.map(ap => `
+                            <tr>
+                                <td style="padding:8px; border-bottom:1px solid #C8EDD8; font-size:13px;">
+                                    ${ap.paciente}</td>
+                                <td style="padding:8px; border-bottom:1px solid #C8EDD8; font-size:13px;">
+                                    ${ap.hora}</td>
+                                <td style="padding:8px; border-bottom:1px solid #C8EDD8; font-size:13px;">
+                                    <span class="badge badge-ok">${ap.spo2}%</span></td>
+                                <td style="padding:8px; border-bottom:1px solid #C8EDD8; font-size:13px;">
+                                    ${ap.duracion}s</td>
+                                <td style="padding:8px; border-bottom:1px solid #C8EDD8; font-size:12px;
+                                    color:#2E7D52;">ID #${ap._interrupcion_id}</td>
+                            </tr>`).join('');
+                }
+            }
+            
+            function cardMicrosd(titulo, valor, color, bg, border) {
+                return `<div style="background:${bg}; border:1px solid ${border}; border-radius:8px;
+                    padding:16px; text-align:center;">
+                    <div style="font-size:11px; color:${color}; font-weight:bold; margin-bottom:6px;">
+                        ${titulo}</div>
+                    <div style="font-size:28px; font-weight:bold; color:${color};">${valor}</div>
+                </div>`;
+            }
+            
+            async function sincronizarMicrosd() {
+                if (!microsdArchivoActual) return;
+                const btn = document.getElementById('btn-sincronizar');
+                btn.textContent = '⏳ Subiendo...';
+                btn.disabled = true;
+            
+                const formData = new FormData();
+                formData.append('archivo', microsdArchivoActual);
+            
+                try {
+                    const res = await fetch('/microsd/sincronizar', { method: 'POST', body: formData });
+                    if (!res.ok) {
+                        const err = await res.json();
+                        mostrarToast('❌ ' + (err.detail || 'Error al sincronizar'));
+                        return;
+                    }
+                    const r = await res.json();
+                    mostrarToast(`✅ Listo: ${r.insertadas} apneas subidas, ${r.ya_existian} ya existían`);
+                    // Re-analizar para refrescar la vista
+                    await analizarMicrosd();
+                } catch (e) {
+                    mostrarToast('❌ Error: ' + e.message);
+                } finally {
+                    btn.textContent = '⬆️ Subir apneas faltantes';
+                    btn.disabled = false;
+                }
             }
 
             window.onload = cargarPacientes;
