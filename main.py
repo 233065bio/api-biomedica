@@ -11,6 +11,7 @@ import bcrypt
 import pandas as pd
 from fastapi import UploadFile, File
 import io
+import math
 
 app = FastAPI()
 
@@ -712,6 +713,7 @@ async def analizar_microsd(request: Request, archivo: UploadFile = File(...)):
         for (nombre_pac, no_apnea, hora_apnea), grupo in grupos:
             nombre_pac  = str(nombre_pac).strip()
             hora_val    = str(hora_apnea).strip()
+            n_muestras  = len(grupo) 
             spo2_val   = limpiar_nan(float(pd.to_numeric(grupo["SpO2"],   errors="coerce").mean()))
             ecg_val    = limpiar_nan(float(pd.to_numeric(grupo["ECG"],    errors="coerce").mean()))
             acce_z_val = limpiar_nan(float(pd.to_numeric(grupo["M.T"],    errors="coerce").mean()))
