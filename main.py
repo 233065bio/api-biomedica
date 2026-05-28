@@ -829,13 +829,13 @@ async def sincronizar_microsd(request: Request, archivo: UploadFile = File(...))
                 cursor = conn.cursor()
                 senales_rows = []
                 for _, fila in grupo.iterrows():
-                ts = int(pd.to_numeric(fila["Tiempo(ms)"], errors="coerce") or 0)
-                senales_rows += [
-                    (interrupcion_id, "ecg",    ts, float(pd.to_numeric(fila["ECG"],   errors="coerce") or 0)),
-                    (interrupcion_id, "spo2",   ts, float(pd.to_numeric(fila["SpO2"],  errors="coerce") or 0)),
-                    (interrupcion_id, "acce_z", ts, float(pd.to_numeric(fila["M.T"],   errors="coerce") or 0)),
-                    (interrupcion_id, "flujo",  ts, float(pd.to_numeric(fila["F.R"],   errors="coerce") or 0)),
-                ]
+                    ts = int(pd.to_numeric(fila["Tiempo(ms)"], errors="coerce") or 0)
+                    senales_rows += [
+                        (interrupcion_id, "ecg",    ts, float(pd.to_numeric(fila["ECG"],   errors="coerce") or 0)),
+                        (interrupcion_id, "spo2",   ts, float(pd.to_numeric(fila["SpO2"],  errors="coerce") or 0)),
+                        (interrupcion_id, "acce_z", ts, float(pd.to_numeric(fila["M.T"],   errors="coerce") or 0)),
+                        (interrupcion_id, "flujo",  ts, float(pd.to_numeric(fila["F.R"],   errors="coerce") or 0)),
+                    ]
                 cursor.executemany(
                     "INSERT INTO senales_esp32 (interrupcion_id, tipo_senal, timestamp_ms, valor) VALUES (%s, %s, %s, %s)",
                     senales_rows
