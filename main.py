@@ -695,12 +695,11 @@ async def analizar_microsd(request: Request, archivo: UploadFile = File(...)):
         for (nombre_pac, no_apnea, hora_apnea), grupo in grupos:
             nombre_pac  = str(nombre_pac).strip()
             hora_val    = str(hora_apnea).strip()
-            spo2_val    = float(grupo["SpO2"].mean())
-            ecg_val     = float(grupo["ECG"].mean())
-            acce_z_val  = float(grupo["M.T"].mean())
-            flujo_val   = float(grupo["F.R"].mean())
-            # Duración estimada: diferencia entre primer y último Tiempo(ms) en segundos
-            tiempos     = grupo["Tiempo(ms)"].values
+            spo2_val   = float(pd.to_numeric(grupo["SpO2"],   errors="coerce").mean())
+            ecg_val    = float(pd.to_numeric(grupo["ECG"],    errors="coerce").mean())
+            acce_z_val = float(pd.to_numeric(grupo["M.T"],    errors="coerce").mean())
+            flujo_val  = float(pd.to_numeric(grupo["F.R"],    errors="coerce").mean())
+            tiempos    = pd.to_numeric(grupo["Tiempo(ms)"], errors="coerce").values
             duracion_ms = float(tiempos[-1] - tiempos[0]) if len(tiempos) > 1 else 0.0
             duracion_s  = round(duracion_ms / 1000.0, 2)
             n_muestras  = len(grupo)
@@ -783,11 +782,11 @@ async def sincronizar_microsd(request: Request, archivo: UploadFile = File(...))
             try:
                 nombre_pac = str(nombre_pac).strip()
                 hora_val   = str(hora_apnea).strip()
-                spo2_val   = float(grupo["SpO2"].mean())
-                ecg_val    = float(grupo["ECG"].mean())
-                acce_z_val = float(grupo["M.T"].mean())
-                flujo_val  = float(grupo["F.R"].mean())
-                tiempos    = grupo["Tiempo(ms)"].values
+                spo2_val   = float(pd.to_numeric(grupo["SpO2"],   errors="coerce").mean())
+                ecg_val    = float(pd.to_numeric(grupo["ECG"],    errors="coerce").mean())
+                acce_z_val = float(pd.to_numeric(grupo["M.T"],    errors="coerce").mean())
+                flujo_val  = float(pd.to_numeric(grupo["F.R"],    errors="coerce").mean())
+                tiempos    = pd.to_numeric(grupo["Tiempo(ms)"], errors="coerce").values
                 duracion_s = round(float(tiempos[-1] - tiempos[0]) / 1000.0, 2) if len(tiempos) > 1 else 0.0
 
                 # Verificar duplicado
@@ -830,13 +829,13 @@ async def sincronizar_microsd(request: Request, archivo: UploadFile = File(...))
                 cursor = conn.cursor()
                 senales_rows = []
                 for _, fila in grupo.iterrows():
-                    ts = int(fila["Tiempo(ms)"])
-                    senales_rows += [
-                        (interrupcion_id, "ecg",    ts, float(fila["ECG"])),
-                        (interrupcion_id, "spo2",   ts, float(fila["SpO2"])),
-                        (interrupcion_id, "acce_z", ts, float(fila["M.T"])),
-                        (interrupcion_id, "flujo",  ts, float(fila["F.R"])),
-                    ]
+                ts = int(pd.to_numeric(fila["Tiempo(ms)"], errors="coerce") or 0)
+                senales_rows += [
+                    (interrupcion_id, "ecg",    ts, float(pd.to_numeric(fila["ECG"],   errors="coerce") or 0)),
+                    (interrupcion_id, "spo2",   ts, float(pd.to_numeric(fila["SpO2"],  errors="coerce") or 0)),
+                    (interrupcion_id, "acce_z", ts, float(pd.to_numeric(fila["M.T"],   errors="coerce") or 0)),
+                    (interrupcion_id, "flujo",  ts, float(pd.to_numeric(fila["F.R"],   errors="coerce") or 0)),
+                ]
                 cursor.executemany(
                     "INSERT INTO senales_esp32 (interrupcion_id, tipo_senal, timestamp_ms, valor) VALUES (%s, %s, %s, %s)",
                     senales_rows
