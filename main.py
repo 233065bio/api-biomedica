@@ -712,14 +712,13 @@ async def analizar_microsd(request: Request, archivo: UploadFile = File(...)):
         for (nombre_pac, no_apnea, hora_apnea), grupo in grupos:
             nombre_pac  = str(nombre_pac).strip()
             hora_val    = str(hora_apnea).strip()
-            spo2_val   = float(pd.to_numeric(grupo["SpO2"],   errors="coerce").mean())
-            ecg_val    = float(pd.to_numeric(grupo["ECG"],    errors="coerce").mean())
-            acce_z_val = float(pd.to_numeric(grupo["M.T"],    errors="coerce").mean())
-            flujo_val  = float(pd.to_numeric(grupo["F.R"],    errors="coerce").mean())
-            tiempos    = pd.to_numeric(grupo["Tiempo(ms)"], errors="coerce").values
+            spo2_val   = limpiar_nan(float(pd.to_numeric(grupo["SpO2"],   errors="coerce").mean()))
+            ecg_val    = limpiar_nan(float(pd.to_numeric(grupo["ECG"],    errors="coerce").mean()))
+            acce_z_val = limpiar_nan(float(pd.to_numeric(grupo["M.T"],    errors="coerce").mean()))
+            flujo_val  = limpiar_nan(float(pd.to_numeric(grupo["F.R"],    errors="coerce").mean()))
+            tiempos    = pd.to_numeric(grupo["Tiempo(ms)"], errors="coerce").dropna().values
             duracion_ms = float(tiempos[-1] - tiempos[0]) if len(tiempos) > 1 else 0.0
-            duracion_s  = round(duracion_ms / 1000.0, 2)
-            n_muestras  = len(grupo)
+            duracion_s  = round(limpiar_nan(duracion_ms / 1000.0), 2)
 
             # Verificar paciente
             cursor.execute("SELECT id FROM pacientes WHERE nombre = %s LIMIT 1", (nombre_pac,))
@@ -918,6 +917,11 @@ def _limpiar_outliers_ecg(timestamps, valores):
 
 import math as _math
 
+def limpiar_nan(val, default=0.0):
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return default
+    return val
+    
 def _construir_resp_desde_streaming(ts_flujo, vs_flujo, ts_accz, vs_accz):
     def media_movil_gauss(valores, ventana):
         if len(valores) <= ventana:
