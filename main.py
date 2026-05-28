@@ -1524,6 +1524,10 @@ def admin_panel(request: Request):
                             <div class="tabs-signal" id="tabs-signal"></div>
                             <div class="charts-area" id="charts-area"></div>
                         </div>
+                </div>  <!-- cierra charts-container -->
+            </div>      <!-- cierra columna derecha del visor-layout -->
+        </div>          <!-- cierra visor-layout -->
+    </div>              <!-- cierra sec-senales -->
 
             <!-- ══ ESTADO SENSORES ══ -->
             <div id="sec-estado" class="section">
