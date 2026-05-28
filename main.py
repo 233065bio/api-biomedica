@@ -3,6 +3,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 import mysql.connector
 import os
 import bcrypt
@@ -19,7 +21,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+@app.exception_handler(Exception)
+async def generic_exception_handler(request, exc):
+    import traceback
+    print(f"[UNHANDLED] {exc}\n{traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)}
+    )
 
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
@@ -2448,8 +2457,14 @@ def admin_panel(request: Request):
                 try {
                     const res = await fetch('/microsd/analizar', { method: 'POST', body: formData });
                     if (!res.ok) {
-                        const err = await res.json();
-                        mostrarToast('❌ ' + (err.detail || 'Error al analizar'));
+                        let msg = 'Error al analizar';
+                        try {
+                            const err = await res.json();
+                            msg = err.detail || msg;
+                        } catch {
+                            msg = await res.text().catch(() => msg);
+                        }
+                        mostrarToast('❌ ' + msg);
                         return;
                     }
                     microsdResultadoActual = await res.json();
