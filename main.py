@@ -682,6 +682,17 @@ async def analizar_microsd(request: Request, archivo: UploadFile = File(...)):
                 status_code=400,
                 detail=f"Columnas requeridas: {requeridas}. Encontradas: {set(df.columns)}"
             )
+            
+        df = pd.read_excel(io.BytesIO(contenido))
+        df.columns = [c.strip() for c in df.columns]
+        
+        # ── NUEVO: limpiar filas de encabezado repetido y filas vacías ──
+        df = df[df["No_Apneas"].notna()]                        # elimina filas vacías
+        df = df[df["No_Apneas"].astype(str).str.strip() != "No_Apneas"]  # elimina encabezados repetidos
+        df["No_Apneas"] = pd.to_numeric(df["No_Apneas"], errors="coerce")
+        df = df[df["No_Apneas"].notna()]                        # elimina cualquier residuo no numérico
+        df["No_Apneas"] = df["No_Apneas"].astype(int)
+        # ────────────────────────────────────────────────────────────────
 
         # Agrupar por paciente + No_Apneas + Hora_Apnea → una apnea por grupo
         grupos = df.groupby(["Nombre_Paciente", "No_Apneas", "Hora_Apnea"])
@@ -772,6 +783,16 @@ async def sincronizar_microsd(request: Request, archivo: UploadFile = File(...))
         contenido = await archivo.read()
         df = pd.read_excel(io.BytesIO(contenido))
         df.columns = [c.strip() for c in df.columns]
+         df = pd.read_excel(io.BytesIO(contenido))
+        df.columns = [c.strip() for c in df.columns]
+        
+        # ── NUEVO: limpiar filas de encabezado repetido y filas vacías ──
+        df = df[df["No_Apneas"].notna()]                        # elimina filas vacías
+        df = df[df["No_Apneas"].astype(str).str.strip() != "No_Apneas"]  # elimina encabezados repetidos
+        df["No_Apneas"] = pd.to_numeric(df["No_Apneas"], errors="coerce")
+        df = df[df["No_Apneas"].notna()]                        # elimina cualquier residuo no numérico
+        df["No_Apneas"] = df["No_Apneas"].astype(int)
+        # ────────────────────────────────────────────────────────────────
 
         grupos     = df.groupby(["Nombre_Paciente", "No_Apneas", "Hora_Apnea"])
         insertadas = []
