@@ -42,6 +42,13 @@ def get_db_connection():
         database=os.getenv("MYSQL_DATABASE"),
         port=int(os.getenv("MYSQL_PORT") or 3306)
     )
+def _ensure_column(cursor, table, column, definition):
+    cursor.execute("""
+        SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s
+    """, (table, column))
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 def verificar_sesion(request: Request):
     return request.cookies.get("session") == "ok"
@@ -142,6 +149,9 @@ def startup_event():
                 "INSERT INTO usuarios (usuario, contrasena) VALUES ('admin', %s)",
                 (hashed,)
             )
+        _ensure_column(cursor, "pacientes", "microdespertares", "VARCHAR(20)")
+        _ensure_column(cursor, "pacientes", "interrupciones_hora_estimadas", "VARCHAR(20)")
+        _ensure_column(cursor, "pacientes", "epworth_estimado", "INT")
         conn.commit()
         cursor.close()
         conn.close()
@@ -174,6 +184,9 @@ class PacienteModel(BaseModel):
     enfermedad_cardiovascular: Optional[str] = None
     imc: Optional[float] = None
     epworth: Optional[int] = None
+    epworth_estimado: Optional[int] = None
+    microdespertares: Optional[str] = None
+    interrupciones_hora_estimadas: Optional[str] = None
 
 class UsuarioModel(BaseModel):
     usuario: str
@@ -1168,8 +1181,12 @@ def crear_paciente(data: PacienteModel, request: Request):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO pacientes (nombre, fecha_estudio, edad, sexo, enfermedad_cardiovascular, imc, epworth) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-        (data.nombre, data.fecha_estudio, data.edad, data.sexo, data.enfermedad_cardiovascular, data.imc, data.epworth)
+        """INSERT INTO pacientes
+           (nombre, fecha_estudio, edad, sexo, enfermedad_cardiovascular, imc, epworth,
+            epworth_estimado, microdespertares, interrupciones_hora_estimadas)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+        (data.nombre, data.fecha_estudio, data.edad, data.sexo, data.enfermedad_cardiovascular,
+         data.imc, data.epworth, data.epworth_estimado, data.microdespertares, data.interrupciones_hora_estimadas)
     )
     conn.commit()
     cursor.close()
@@ -1183,8 +1200,13 @@ def editar_paciente(paciente_id: int, data: PacienteModel, request: Request):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE pacientes SET nombre=%s, fecha_estudio=%s, edad=%s, sexo=%s, enfermedad_cardiovascular=%s, imc=%s, epworth=%s WHERE id=%s",
-        (data.nombre, data.fecha_estudio, data.edad, data.sexo, data.enfermedad_cardiovascular, data.imc, data.epworth, paciente_id)
+        """UPDATE pacientes SET
+           nombre=%s, fecha_estudio=%s, edad=%s, sexo=%s, enfermedad_cardiovascular=%s,
+           imc=%s, epworth=%s, epworth_estimado=%s, microdespertares=%s, interrupciones_hora_estimadas=%s
+           WHERE id=%s""",
+        (data.nombre, data.fecha_estudio, data.edad, data.sexo, data.enfermedad_cardiovascular,
+         data.imc, data.epworth, data.epworth_estimado, data.microdespertares,
+         data.interrupciones_hora_estimadas, paciente_id)
     )
     conn.commit()
     cursor.close()
